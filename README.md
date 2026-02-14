@@ -26,27 +26,27 @@ Tested with locally downloaded weights:
 Install in editable mode and launch an OpenAI-compatible server:
 
 ```bash
-pip install -e .
-adallm serve ./models/Qwen3-8B-NVFP4
+pip install git+https://github.com/BenChaliah/NVFP4-on-4090-vLLM.git
+adallm serve nvidia/Qwen3-8B-NVFP4
 ```
 
-You can also pass a Hugging Face repo ID; it will use the cache if present,
-otherwise it will download into the default cache directory:
+You can pass a Hugging Face repo ID like above (it will use the cache if present,
+otherwise it will download into the default cache directory) or specify the path of the model directory.
 
 ```bash
-adallm serve nvidia/Qwen3-8B-NVFP4
+adallm serve ./models/Qwen3-8B-NVFP4
 ```
 
 Interactive mode (prompt repeatedly, `\\q` to quit):
 
 ```bash
-adallm run ./models/Qwen3-8B-NVFP4
+adallm run nvidia/Qwen3-8B-NVFP4
 ```
 
 Stream to terminal:
 
 ```bash
-adallm run ./models/Qwen3-8B-NVFP4 "Once upon a time"
+adallm run nvidia/Qwen3-8B-NVFP4 "Once upon a time"
 ```
 
 ## CLI options
