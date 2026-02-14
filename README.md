@@ -12,14 +12,9 @@ This repo targets NVFP4 weights and keeps the entire decode path in FP8, includi
 - Keeps an NVFP4-only fast path; no silent fallback to FP16 for decode.
 - MoE support works but is not fully optimized yet (in progress).
 
-## Models
+## Demo
+![short_demo](https://github.com/user-attachments/assets/72f4914e-0f0c-401e-ad7a-cd9ebb9ad1f3)
 
-Tested with locally downloaded weights:
-
-- Qwen3-8B-NVFP4  
-  https://huggingface.co/nvidia/Qwen3-8B-NVFP4
-- Gemma3-27B-it-NVFP4  
-  https://huggingface.co/BenChaliah/Gemma3-27B-it-NVFP4
 
 ## Quickstart
 
@@ -73,6 +68,15 @@ Environment toggles:
 
 - `ADALLM_QUIET=1`: Suppress startup logs.
 - `ADALLM_DISABLE_PROGRESS=1`: Hide weight-loading progress bar.
+
+## Models
+
+Tested with locally downloaded weights:
+
+- Qwen3-8B-NVFP4  
+  https://huggingface.co/nvidia/Qwen3-8B-NVFP4
+- Gemma3-27B-it-NVFP4  
+  https://huggingface.co/BenChaliah/Gemma3-27B-it-NVFP4
 
 ## How it works (short version)
 
