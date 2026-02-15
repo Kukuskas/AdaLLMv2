@@ -18,7 +18,7 @@ This repo targets NVFP4 weights and keeps the entire decode path in FP8, includi
 
 ## Quickstart
 
-Install in editable mode and launch an OpenAI-compatible server:
+Install and launch an OpenAI-compatible server:
 
 ```bash
 pip install git+https://github.com/BenChaliah/NVFP4-on-4090-vLLM.git
