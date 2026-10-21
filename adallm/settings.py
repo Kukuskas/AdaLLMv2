@@ -105,6 +105,24 @@ def _load_local_config(model_path: str):
     model_type = cfg.get("model_type", "")
     if model_type in ("gemma3", "gemma3_text"):
         return _load_gemma3_config(model_path)
+
+    # Qwen3.5 / Qwen3.8-27B (QUASAR NVFP4): multimodal wrapper around a hybrid
+    # text model. Build a flat namespace from text_config; drop vision entirely.
+    if model_type == "qwen3_5":
+        text = cfg.get("text_config", {})
+        skip = {"model_type", "dtype", "rope_parameters", "architectures", "torch_dtype",
+                "quantization_config", "max_position_embeddings"}
+        ns = SimpleNamespace(
+            model_type="qwen3_5",
+            architectures=cfg.get("architectures"),
+            torch_dtype=_dtype_from_str(cfg.get("torch_dtype") or cfg.get("dtype")),
+            max_position_embeddings=text.get("max_position_embeddings", 262144),
+            quantization_config=cfg.get("quantization_config", None),
+            **{k: v for k, v in text.items() if k not in skip},
+            rope_parameters=text.get("rope_parameters", {}),
+        )
+        return ns
+
     return None
 
 
@@ -155,7 +173,9 @@ class Config:
         if self.hf_config is None:
             self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
-        assert self.max_num_batched_tokens >= self.max_model_len
+        # Chunked prefill: batched tokens no longer needs to cover max_model_len
+        # (hybrid/long-context models prefill in chunks of max_num_batched_tokens).
+        assert self.max_num_batched_tokens >= 256
         if self.kv_cache_max_blocks < 0:
             # Cap KV cache to configured max tokens instead of filling GPU memory.
             self.kv_cache_max_blocks = max(

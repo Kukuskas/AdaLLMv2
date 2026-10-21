@@ -49,10 +49,23 @@ def _fp8_supported() -> bool:
     return (major, minor) >= (8, 9)
 
 
+_FP4_LUT_BY_DEVICE: dict = {}
+
+
 def _fp4_lut_on_device(device: torch.device) -> torch.Tensor:
-    if _FP4_LUT.device != device:
-        return _FP4_LUT.to(device=device, non_blocking=True)
-    return _FP4_LUT
+    key = (device.type, device.index)
+    lut = _FP4_LUT_BY_DEVICE.get(key)
+    if lut is None:
+        lut = _FP4_LUT.to(device=device)
+        _FP4_LUT_BY_DEVICE[key] = lut
+    return lut
+
+
+def warm_cudagraph_buffers(device: torch.device) -> None:
+    """Materialize all lazily-created device constants (LUT) BEFORE CUDA graph
+    capture. Otherwise the first .to(device) copy inside the capture raises
+    'Cannot copy between CPU and CUDA tensors during CUDA graph capture'."""
+    _fp4_lut_on_device(device)
 
 
 @triton.jit
@@ -480,7 +493,8 @@ def nvfp4_linear(
 
     lut = _fp4_lut_on_device(x.device)
     def _select_config(m, n, k):
-        # Decode: small M; Prefill: larger M.
+        # Decode: small M; Prefill: larger M. (Swept on RTX 4090 Oct 2026:
+        # in-model best is the stock config; microbench wins don't transfer.)
         if m <= 16:
             return dict(BLOCK_M=16, BLOCK_N=64, BLOCK_K=64, num_warps=4, num_stages=3)
         if m <= 64:

@@ -3,6 +3,17 @@ import torch
 from torch import nn
 
 
+def _maybe_compile(fn):
+    """torch.compile optional: inductor's fork-pool compile workers deadlock
+    when shapes change at runtime under a server (RTX 4090, Oct 2026)."""
+    import os
+    import functools
+    if os.getenv("ADALLM_NO_COMPILE", ""):
+        return fn
+    return torch.compile(fn)
+
+
+
 def apply_rotary_emb(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -42,7 +53,7 @@ class RotaryEmbedding(nn.Module):
         cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
-    @torch.compile
+    @_maybe_compile
     def forward(
         self,
         positions: torch.Tensor,

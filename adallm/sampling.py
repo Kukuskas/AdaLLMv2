@@ -9,4 +9,4 @@ class SamplingParams:
     seed: int | None = None
 
     def __post_init__(self):
-        assert self.temperature > 1e-10, "greedy sampling is not permitted"
+        assert self.temperature >= 0, "temperature must be >= 0 (0 = greedy)"

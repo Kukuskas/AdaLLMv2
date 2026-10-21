@@ -54,6 +54,11 @@ def set_quant_config(hf_config, config) -> None:
         except Exception:
             kv_bits = None
 
+        # QUASAR-QAT checkpoints: compressed-tensors nvfp4-pack-quantized (W4A4),
+        # no quant_algo field. Detect via format + group_size 16.
+        if algo is None and qc.get("format") == "nvfp4-pack-quantized":
+            algo = "NVFP4"
+
     _QUANT_CONFIG.enabled = (algo == "NVFP4")
     _QUANT_CONFIG.algo = algo
     if group_size is not None:

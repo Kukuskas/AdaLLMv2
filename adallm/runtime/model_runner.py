@@ -1,5 +1,12 @@
+import os
 import pickle
+import sys
 import torch
+
+# Pinned staging allocations can deadlock when created from a non-main engine
+# thread (cudaHostAlloc cross-thread contention). Main thread may pin; the
+# serve engine thread must not.
+_PIN = os.getenv("ADALLM_NO_PIN", "") != "1"
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
@@ -58,6 +65,10 @@ class ModelRunner:
             self.enforce_eager = True
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        # Materialize lazily-created device constants (FP4 LUT) before any
+        # CUDA graph capture; also runs them once for Triton JIT warmup.
+        from adallm.ops.nvfp4_gemm import warm_cudagraph_buffers
+        warm_cudagraph_buffers(torch.device("cuda", torch.cuda.current_device()))
         self.warmup_model()
         self.allocate_kv_cache()
         self.fp8_decode_selftest()
@@ -145,21 +156,50 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         kv_dtype = qcfg.kv_cache_dtype if qcfg.enabled else hf_config.torch_dtype
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * kv_dtype.itemsize
+        if os.getenv("ADALLM_DEBUG_KV", ""):
+            print(f"[kv] free={free/2**30:.2f}GiB total={total/2**30:.2f}GiB used={used/2**30:.2f}GiB "
+                  f"peak={peak/2**30:.2f}GiB current={current/2**30:.2f}GiB util={config.gpu_memory_utilization}",
+                  file=sys.stderr, flush=True)
+        # Hybrid models: only full-attention layers hold a KV cache.
+        layer_types = getattr(hf_config, "layer_types", None)
+        if layer_types:
+            num_kv_layers = sum(1 for t in layer_types if t == "full_attention")
+        else:
+            num_kv_layers = hf_config.num_hidden_layers
+        block_bytes = 2 * num_kv_layers * self.block_size * num_kv_heads * head_dim * kv_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         if config.kv_cache_max_blocks > 0:
             config.num_kvcache_blocks = min(config.num_kvcache_blocks, config.kv_cache_max_blocks)
+        if os.getenv("ADALLM_DEBUG_KV", ""):
+            print(f"[kv] num_kv_layers={num_kv_layers} block_bytes={block_bytes/2**20:.2f}MiB "
+                  f"num_kvcache_blocks={config.num_kvcache_blocks} cap={config.kv_cache_max_blocks}",
+                  file=sys.stderr, flush=True)
         assert config.num_kvcache_blocks > 0
         # Layout: [block, token, kv_head, head_dim] for both FP8 and FP16/BF16 caches.
         self.kv_cache = torch.empty(
             2,
-            hf_config.num_hidden_layers,
+            num_kv_layers,
             config.num_kvcache_blocks,
             self.block_size,
             num_kv_heads,
             head_dim,
             dtype=kv_dtype,
         )
+        # Delta-net (mamba-style) state pools for hybrid models. One slot per
+        # concurrent sequence (+ reserved NULL slot 0) keeps state updates
+        # inside kernels → CUDA-graph safe and multi-sequence correct.
+        from adallm.architectures.qwen3_5 import Qwen3_5GatedDeltaNet
+        delta_modules = [m for m in self.model.modules() if isinstance(m, Qwen3_5GatedDeltaNet)]
+        num_delta_slots = config.max_num_seqs + 2
+        # ensure pool covers every CUDA-graph batch size (padded rows may use
+        # slot ids up to graph_bs; NULL rows use 0)
+        num_delta_slots = max(num_delta_slots, (min(config.max_num_seqs, 512) + 2))
+        state_dtype = hf_config.torch_dtype if hf_config is not None else torch.bfloat16
+        for m in delta_modules:
+            m.allocate_state_pool(num_delta_slots, self.kv_cache.device, state_dtype)
+        self.delta_num_layers = len(delta_modules)
+        self.delta_modules = delta_modules
+        self.graph_delta_slots = torch.zeros(num_delta_slots, dtype=torch.int64, device=self.kv_cache.device)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -231,10 +271,17 @@ class ModelRunner:
         except Exception as exc:
             raise RuntimeError("FP8 KV decode kernel selftest failed.") from exc
 
+    def _reset_delta_slot(self, slot: int):
+        """Zero a recycled delta-net state slot (all layers) for a fresh sequence."""
+        for m in self.delta_modules:
+            if m.mamba_state is not None:
+                m.mamba_state[slot].zero_()
+                m.conv_state[slot].zero_()
+
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=_PIN).cuda(non_blocking=True)
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
@@ -246,33 +293,44 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
+        delta_slots = []
         for seq in seqs:
-            seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens:])
-            positions.extend(list(range(seq.num_cached_tokens, seqlen)))
-            seqlen_q = seqlen - seq.num_cached_tokens
-            seqlen_k = seqlen
+            start = seq.num_cached_tokens + seq.num_prefilled_tokens
+            chunk = seq.cur_chunk if seq.cur_chunk > 0 else len(seq) - start
+            input_ids.extend(seq[start : start + chunk])
+            positions.extend(list(range(start, start + chunk)))
+            seqlen_q = chunk
+            seqlen_k = start + chunk
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
+            if seq.delta_slot > 0 and seq.num_prefilled_tokens == 0 and seq.num_cached_tokens == 0:
+                self._reset_delta_slot(seq.delta_slot)    # fresh seq: zero recycled state
+            delta_slots.append(seq.delta_slot)
             if not seq.block_table:    # warmup
                 continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
-                    end = start + self.block_size
-                else:
-                    end = start + seq.last_block_num_tokens 
-                slot_mapping.extend(list(range(start, end)))
+            # slot_mapping must cover ONLY this chunk's tokens (chunked prefill)
+            tok_begin, tok_end = start, start + chunk
+            blk_begin = tok_begin // self.block_size
+            blk_end = (tok_end - 1) // self.block_size
+            for bi in range(blk_begin, blk_end + 1):
+                blk_tok_lo = bi * self.block_size
+                blk_tok_hi = min(blk_tok_lo + self.block_size, seq.num_tokens)
+                lo = max(blk_tok_lo, tok_begin)
+                hi = min(blk_tok_hi, tok_end)
+                block_id = seq.block_table[bi]
+                base = block_id * self.block_size
+                slot_mapping.extend(list(range(base + (lo - blk_tok_lo), base + (hi - blk_tok_lo))))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=_PIN).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=_PIN).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=_PIN).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=_PIN).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=_PIN).cuda(non_blocking=True)
+        delta_slots = torch.tensor(delta_slots, dtype=torch.int64, pin_memory=_PIN).cuda(non_blocking=True)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, delta_slots)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -280,28 +338,31 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
+        delta_slots = []
         max_seqlen_k = 0
         for seq in seqs:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             seq_len = len(seq)
             context_lens.append(seq_len)
+            delta_slots.append(seq.delta_slot)
             if seq_len > max_seqlen_k:
                 max_seqlen_k = seq_len
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=_PIN).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=_PIN).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=_PIN).cuda(non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=_PIN).cuda(non_blocking=True)
+        delta_slots = torch.tensor(delta_slots, dtype=torch.int64, pin_memory=_PIN).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, max_seqlen_k=max_seqlen_k)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, max_seqlen_k=max_seqlen_k, delta_slots=delta_slots)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = []
         for seq in seqs:
             temperatures.append(seq.temperature)
-        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=_PIN).cuda(non_blocking=True)
         return temperatures
 
     @torch.inference_mode()
@@ -310,7 +371,8 @@ class ModelRunner:
             return self.model.compute_logits(self.model(input_ids, positions))
         bs = input_ids.size(0)
         context = get_context()
-        graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+        graph_key = next(x for x in self.graph_bs if x >= bs)
+        graph, slots_buf = self.graphs[graph_key]
         graph_vars = self.graph_vars
         graph_vars["input_ids"][:bs] = input_ids
         graph_vars["positions"][:bs] = positions
@@ -319,6 +381,8 @@ class ModelRunner:
         graph_vars["context_lens"].zero_()
         graph_vars["context_lens"][:bs] = context.context_lens
         graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        slots_buf[:bs] = context.delta_slots[:bs]
+        slots_buf[bs:] = 0    # padding rows → NULL slot (kernels skip them)
         graph.replay()
         return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -327,6 +391,9 @@ class ModelRunner:
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        if is_prefill and token_ids is not None:
+            # intermediate chunked-prefill chunks advance the cursor only
+            token_ids = [tid if seq.chunk_final else -1 for seq, tid in zip(seqs, token_ids)]
         reset_context()
         return token_ids
 
@@ -342,19 +409,23 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = [bs for bs in ([1, 2, 4, 8] + list(range(16, max_bs + 1, 16))) if bs <= max_bs]
         self.graphs = {}
         self.graph_pool = None
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs], max_seqlen_k=config.max_model_len)
+            # Persistent per-batch delta slot buffer: run_model copies actual
+            # slot ids here before replay; kernels read them on-device.
+            slots_buf = torch.zeros(bs, dtype=torch.int64, device="cuda")
+            self.graph_delta_slots[:bs] = 0    # all NULL during capture warmup
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs], max_seqlen_k=config.max_model_len, delta_slots=slots_buf)
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+            self.graphs[bs] = (graph, slots_buf)
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
-            self.graphs[bs] = graph
             torch.cuda.synchronize()
             reset_context()
 

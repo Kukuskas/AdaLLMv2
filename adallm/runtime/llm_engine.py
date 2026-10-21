@@ -94,7 +94,10 @@ class LLMEngine:
         seqs, is_prefill = self.scheduler.schedule()
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         updates = self.scheduler.postprocess(seqs, token_ids)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        outputs = [
+            (seq.seq_id, seq.completion_token_ids, seq.finish_reason)
+            for seq in seqs if seq.is_finished
+        ]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         if return_updates:
             return outputs, num_tokens, updates
@@ -127,6 +130,7 @@ class LLMEngine:
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
         outputs = {}
+        finish_reasons = {}
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
             t = perf_counter()
@@ -140,12 +144,20 @@ class LLMEngine:
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",
                 })
-            for seq_id, token_ids in output:
+            for seq_id, token_ids, fin in output:
                 outputs[seq_id] = token_ids
+                finish_reasons[seq_id] = fin
                 if use_tqdm:
                     pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        outputs = [
+            {"text": self.tokenizer.decode(token_ids), "token_ids": token_ids,
+             "finish_reason": finish_reasons.get(seq_id)}
+            for seq_id, token_ids in zip(sorted(finish_reasons.keys()), outputs)
+        ] if finish_reasons else [
+            {"text": self.tokenizer.decode(token_ids), "token_ids": token_ids, "finish_reason": None}
+            for token_ids in outputs
+        ]
         if use_tqdm:
             pbar.close()
         return outputs
@@ -173,6 +185,8 @@ class LLMEngine:
         while not self.is_finished():
             _, _, updates = self.step(return_updates=True)
             for seq_id, token_id, finished in updates:
+                if token_id == -1:
+                    continue    # intermediate prefill chunk, no token emitted
                 text = self.tokenizer.decode([token_id], skip_special_tokens=True)
                 yield seq_id, token_id, text, finished
 

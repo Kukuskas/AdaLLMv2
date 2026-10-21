@@ -12,6 +12,7 @@ class Context:
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
+    delta_slots: torch.Tensor | None = None    # [N] int64 state-pool slot per sequence
 
 _CONTEXT = Context()
 
@@ -27,6 +28,7 @@ def set_context(
     slot_mapping=None,
     context_lens=None,
     block_tables=None,
+    delta_slots=None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -38,6 +40,7 @@ def set_context(
         slot_mapping,
         context_lens,
         block_tables,
+        delta_slots,
     )
 
 def reset_context():

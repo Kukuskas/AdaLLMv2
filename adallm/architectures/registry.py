@@ -9,6 +9,11 @@ def build_model(hf_config):
     if model_type in ("gemma3", "gemma3_text"):
         return Gemma3ForConditionalGeneration(hf_config), False
 
+    if model_type == "qwen3_5":
+        from adallm.architectures.qwen3_5 import Qwen3_5ForCausalLM
+        text_cfg = getattr(hf_config, "text_config", None) or hf_config
+        return Qwen3_5ForCausalLM(text_cfg, max_position=getattr(hf_config, "max_model_len", None)), False
+
     is_next = model_type == "qwen3_next"
     is_moe = isinstance(hf_config, Qwen3MoeConfig) or model_type in ("qwen3_moe", "qwen3_next")
     if is_moe:

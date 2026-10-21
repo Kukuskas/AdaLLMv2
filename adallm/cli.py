@@ -71,6 +71,7 @@ def _add_serve_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--enforce-eager", action="store_true")
 
     parser.add_argument("--kv-cache-dtype", default="fp8")
+    parser.add_argument("--kv-cache-max-blocks", type=int, default=-1)
     parser.add_argument(
         "--fp8-decode-kernel-enabled",
         action=argparse.BooleanOptionalAction,
@@ -136,6 +137,7 @@ def _handle_serve(args: argparse.Namespace) -> None:
         tensor_parallel_size=args.tensor_parallel_size,
         enforce_eager=args.enforce_eager,
         kv_cache_dtype=args.kv_cache_dtype,
+        kv_cache_max_blocks=args.kv_cache_max_blocks,
         fp8_decode_kernel_enabled=args.fp8_decode_kernel_enabled,
         fp8_decode_kernel_min_ctx=args.fp8_decode_kernel_min_ctx,
     )
@@ -152,6 +154,7 @@ def _handle_run(args: argparse.Namespace) -> None:
         gpu_memory_utilization=args.gpu_memory_utilization,
         tensor_parallel_size=args.tensor_parallel_size,
         kv_cache_dtype=args.kv_cache_dtype,
+        kv_cache_max_blocks=args.kv_cache_max_blocks,
         fp8_decode_kernel_enabled=args.fp8_decode_kernel_enabled,
         fp8_decode_kernel_min_ctx=args.fp8_decode_kernel_min_ctx,
     )

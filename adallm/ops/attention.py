@@ -114,9 +114,13 @@ def fp8_kv_decode_kernel(
 
 def _make_fp8_decode_autotune_configs():
     # Keep a small, safe config set to avoid shared-memory OOR during autotune.
+    # NOTE: with HEAD_DIM=256 (Qwen3.8 family), BLOCK_T=64 @ num_stages=2
+    # requires ~133KB shared memory > 99KB RTX 4090 limit. BLOCK_T=32 and/or
+    # num_stages=1 stay within budget.
     return [
-        triton.Config({"BLOCK_T": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_T": 64}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_T": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_T": 32}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_T": 64}, num_warps=4, num_stages=1),
     ]
 
 

@@ -31,9 +31,11 @@ def _is_aux_quant_tensor(name: str, keep_weight_scales: bool) -> bool:
 
 
 def _should_ignore_weight(name: str) -> bool:
-    if name.startswith(("vision_tower.", "multi_modal_projector.")):
+    if name.startswith(("vision_tower.", "multi_modal_projector.", "model.visual.")):
         return True
-    if ".vision_tower." in name or ".multi_modal_projector." in name:
+    if ".vision_tower." in name or ".multi_modal_projector." in name or ".visual." in name:
+        return True
+    if ".mtp." in name or name.startswith("mtp."):
         return True
     return False
 
@@ -77,13 +79,48 @@ def load_model(model: nn.Module, path: str):
     )
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
+            all_keys = set(f.keys())
             for weight_name in f.keys():
+                # key in the actual file (differs from weight_name after remap)
+                file_key = weight_name
+                # QUASAR W4A4 static activation scales: unused by this runtime
+                # (FP8 activation quant is dynamic). Skip entirely.
+                if weight_name.endswith(".input_global_scale"):
+                    continue
+                # Per-tensor global scale: merged into weight_scale_2 by the
+                # .weight_packed branch below; skip the standalone key.
+                if weight_name.endswith(".weight_global_scale"):
+                    continue
+                # QUASAR-QAT naming: <module>.weight_packed (+ _scale/_global_scale).
+                # Remap to the ModelOpt convention the rest of the loader expects:
+                #   weight_packed -> weight (uint8 packed)
+                #   weight_scale (fp8 per-group) stays, dequantized to fp16 below
+                #   weight_global_scale -> weight_scale_2 (fp32 scalar)
+                orig_name = None
+                if weight_name.endswith(".weight_packed"):
+                    orig_name = weight_name
+                    weight_name = weight_name[: -len(".weight_packed")] + ".weight"
+                    # global scale key is derived from the REMAPPED name:
+                    # <base>.weight_global_scale (not ..._packed_global_scale)
+                    global_scale_name = weight_name + "_global_scale"
+                    if global_scale_name in all_keys:
+                        gs = f.get_tensor(global_scale_name).float().reshape(()).item()
+                        if gs == 0:
+                            gs = 1.0
+                        # QUASAR global scale semantics: effective scale =
+                        # weight_scale_fp8 / global_scale. ModelOpt's scale_2 is
+                        # a MULTIPLIER, so store the reciprocal.
+                        try:
+                            param = model.get_parameter(weight_name + "_scale_2")
+                            param.data.copy_(torch.tensor(1.0 / gs))
+                        except (KeyError, AttributeError):
+                            pass  # dequant mode: no scale_2 param; merged below
                 if _is_aux_quant_tensor(weight_name, keep_weight_scales):
                     # These are handled alongside the packed weight or ignored.
                     continue
                 if _should_ignore_weight(weight_name):
                     continue
-                loaded_weight = f.get_tensor(weight_name)
+                loaded_weight = f.get_tensor(file_key)
                 use_nvfp4 = (
                     loaded_weight.dtype == torch.uint8
                     and weight_name.endswith(".weight")
@@ -93,6 +130,13 @@ def load_model(model: nn.Module, path: str):
                     weight_scale = f.get_tensor(weight_name + "_scale")
                     weight_scale_2_name = weight_name + "_scale_2"
                     weight_scale_2 = f.get_tensor(weight_scale_2_name) if weight_scale_2_name in f.keys() else None
+                    if weight_scale_2 is None:
+                        # QUASAR: per-tensor scale lives in <name>.weight_global_scale
+                        # (derived from the remapped name), with DIVISION semantics.
+                        gs_name = weight_name + "_global_scale"
+                        if gs_name in f.keys():
+                            gs = f.get_tensor(gs_name).float().reshape(()).item()
+                            weight_scale_2 = torch.tensor(1.0 / (gs if gs != 0 else 1.0))
                     loaded_weight = dequant_nvfp4(
                         loaded_weight,
                         weight_scale,

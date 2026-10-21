@@ -27,6 +27,13 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        # delta-net state pool slot (0 = NULL/unassigned until allocated)
+        self.delta_slot = 0
+        # chunked prefill bookkeeping
+        self.num_prefilled_tokens = 0
+        self.cur_chunk = -1
+        self.chunk_final = True
+        self.finish_reason: str | None = None    # 'stop' | 'length' when done
 
     def __len__(self):
         return self.num_tokens
