@@ -558,9 +558,9 @@ def serve(
     fp8_decode_kernel_min_ctx: int = 0,
 ) -> None:
     model_path = resolve_model_path(model, download_dir)
-    # MTP speculative decoding (Round5-A): env-gated. Requires eager mode
-    # (draft capture wrapper) and single-seq spec steps; falls back silently
-    # to plain decode for concurrent batches.
+    # MTP speculative decoding (Round5-A port to marlin-b): env-gated. Requires
+    # eager mode (draft capture wrapper) and single-seq spec steps; falls back
+    # silently to plain decode for concurrent batches.
     _use_mtp = bool(os.getenv("ADALLM_MTP"))
     if _use_mtp:
         enforce_eager = True  # spec engine wraps run_model; graphs unsupported
@@ -584,7 +584,7 @@ def serve(
             spec = SpecEngine2(llm)
             spec.install()
             print(f"[mtp] speculative decoding enabled: k={spec.k} "
-                  f"(acceptance 30-65%, 2-3 tok/step measured; eager mode)", flush=True)
+                  f"(Round6-B: queue-server compatible; eager mode)", flush=True)
         except Exception as e:
             print(f"[mtp] init FAILED ({e!r}); serving without MTP", flush=True)
     app = _build_app(llm, model)

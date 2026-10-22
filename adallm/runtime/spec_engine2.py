@@ -131,7 +131,12 @@ class SpecEngine2:
                     self.stats["fallbacks"] += 1
                     if self._snap:
                         try:
-                            self._restore_seq(self._snap[0], self._snap[1])
+                            # Round6-B: correct arity + also restore delta state
+                            # (was _restore_seq(snap0, snap1): TypeError was
+                            # swallowed by this except, leaving seq corrupt
+                            # after every spec-step exception)
+                            self._restore_seq(running[0], self._snap[0])
+                            _restore_delta(self.mr, self._snap[1])
                         except Exception:
                             pass
                         self._snap = None
@@ -146,21 +151,30 @@ class SpecEngine2:
                 s = seqs[0]
                 self._pending = (self._capture_hidden[-1:].to(torch.bfloat16),
                                  s.last_token)
-        if return_updates and out is not None:
-            return out + ([],)
-        return out
+        # Round6-B (queue-server deadlock fix): _plain/_spec return 3-tuples
+        # (outputs, num_tokens, updates). The previous `out + ([],)` returned
+        # updates ALWAYS empty, which starved the queue engine loop
+        # (_engine_loop fans tokens to per-request queues from updates) and
+        # llm.generate_stream: requests hung forever on q.get().
+        if return_updates:
+            return out          # (outputs, num_tokens, updates)
+        assert out is not None
+        return out[0], out[1]
 
     # ---------- plain ----------
 
     def _plain(self):
         seqs, is_prefill = self.sched.schedule()
         token_ids = self.mr.run(seqs, is_prefill)
-        self.sched.postprocess(seqs, token_ids)
+        # Round6-B: return postprocess's per-token updates ((seq_id, tok, fin)
+        # tuples) so queue-mode consumers receive tokens (same contract as
+        # LLMEngine.step).
+        updates = self.sched.postprocess(seqs, token_ids)
         outputs = [(s.seq_id, s.completion_token_ids, s.finish_reason)
                    for s in seqs if s.is_finished]
         num_tokens = sum(len(s) for s in seqs) if is_prefill else -len(seqs)
         self.stats["plain_steps"] += 1
-        return outputs, num_tokens
+        return outputs, num_tokens, updates
 
     # ---------- snapshot / restore ----------
 
@@ -306,6 +320,16 @@ class SpecEngine2:
                 break
         correction = t_greedy[accepted]
         finals = proposals[:accepted] + [correction]
+        # Round6-B: truncate at the FIRST EOS — the plain engine stops there
+        # (postprocess); finals bypass postprocess, so without this a mid-list
+        # accepted EOS would be followed by extra tokens.
+        if not seq.ignore_eos:
+            _eos = sched.eos
+            _eos_set = _eos if isinstance(_eos, set) else {_eos}
+            for _i, _t in enumerate(finals[:-1]):
+                if _t in _eos_set:
+                    finals = finals[: _i + 1]
+                    break
 
         # restore to pre-verify state
         self._restore_seq(seq, self._snap[0])
@@ -334,6 +358,31 @@ class SpecEngine2:
                     f"snap_last={self._snap[0].get('last_blk') if self._snap else None} "
                     f"n_before={n_before} finals={finals} y={y_last}")
             bm.may_append(seq)
+
+        # Round6-B: EOS short-circuit — if the last final is EOS the seq is
+        # done; replay/3c are pointless (no further tokens needed) and the
+        # upstream code never checks EOS on finals (only on z in 3c), so
+        # without this the seq would decode all the way to max_tokens.
+        if not seq.ignore_eos and finals and finals[-1] in eos_set:
+            seq.finish_reason = "stop"
+            seq.status = _SEQ_FINISHED
+            try:
+                sched.running.remove(seq)
+            except ValueError:
+                pass
+            sched.block_manager.deallocate(seq)
+            if sched.delta_slots is not None and seq.delta_slot:
+                sched.delta_slots.free(seq.delta_slot)
+                seq.delta_slot = 0
+            self._kv.pop(seq.seq_id, None)
+            self.stats["spec_steps"] += 1
+            self.stats["tokens"] += len(finals)
+            self.stats["draft_total"] += k
+            self.stats["draft_accepted"] += accepted
+            outputs = [(seq.seq_id, seq.completion_token_ids, seq.finish_reason)]
+            updates = [(seq.seq_id, t, i == len(finals) - 1)
+                       for i, t in enumerate(finals)]
+            return outputs, -len(finals), updates
 
         # ---- 3b. replay [y, accepted finals except correction] through the
         # target so the delta state contains exactly the accepted tokens in
@@ -378,7 +427,9 @@ class SpecEngine2:
         seqs_d, is_dec = sched.schedule()
         assert not is_dec and seqs_d and seqs_d[0] is seq
         tok_ids_d = mr.run(seqs_d, is_dec)
-        sched.postprocess(seqs_d, tok_ids_d)
+        # Round6-B: keep z's postprocess updates for the fan-out (EOS/max_tokens
+        # on the bonus token are checked there as usual).
+        updates_d = sched.postprocess(seqs_d, tok_ids_d)
 
         fin = seq.is_finished
         reason = seq.finish_reason
@@ -431,7 +482,15 @@ class SpecEngine2:
             _dbg(f"spec {self.stats['spec_steps']}: props={proposals} acc={accepted} "
                  f"rate={self.stats['draft_accepted']/max(1,self.stats['draft_total']):.2f} "
                  f"p1={self.stats['p1_hit']}/{self.stats['p1_total']}")
-        return outputs, -len(finals)
+        # Round6-B: synthesize per-token updates for the finals (they bypass
+        # postprocess), then z's real updates from the 3c decode. The finished
+        # flag rides the LAST update so the queue loop emits "done" exactly
+        # when the seq terminates.
+        updates = [(seq.seq_id, t, False) for t in finals] + list(updates_d)
+        if updates:
+            _sid, _tok, _f = updates[-1]
+            updates[-1] = (_sid, _tok, _f or fin)
+        return outputs, -len(finals), updates
 
     # ---------- misc ----------
 
