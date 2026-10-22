@@ -165,12 +165,18 @@ class SpecEngine2:
     # ---------- snapshot / restore ----------
 
     def _snap_seq(self, seq):
+        bm = self.sched.block_manager
+        last_blk_state = None
+        if seq.block_table:
+            lb = bm.blocks[seq.block_table[-1]]
+            last_blk_state = (lb.hash, list(lb.token_ids))
         return {
             "token_ids": list(seq.token_ids), "num_tokens": seq.num_tokens,
             "num_prefilled_tokens": seq.num_prefilled_tokens,
             "cur_chunk": seq.cur_chunk, "chunk_final": seq.chunk_final,
             "finish_reason": seq.finish_reason,
             "block_table": list(seq.block_table),
+            "last_blk": last_blk_state,
         }
 
     def _restore_seq(self, seq, snap):
@@ -184,8 +190,50 @@ class SpecEngine2:
         bm = self.sched.block_manager
         while len(seq.block_table) > len(snap["block_table"]):
             blk = seq.block_table.pop()
+            bm.blocks[blk].reset()
             if blk not in bm.free_block_ids:
                 bm.free_block_ids.append(blk)
+        if seq.block_table and snap.get("last_blk") is not None:
+            last = bm.blocks[seq.block_table[-1]]
+            h, toks = snap["last_blk"]
+            if h != -1:
+                # re-finalize exactly as it was
+                if last.hash != h:
+                    if last.hash in bm.hash_to_block_id:
+                        del bm.hash_to_block_id[last.hash]
+                    last.update(h, toks)
+                    bm.hash_to_block_id[h] = last.block_id
+            else:
+                if last.hash != -1:
+                    if last.hash in bm.hash_to_block_id:
+                        del bm.hash_to_block_id[last.hash]
+                    last.reset()
+
+    def _reconcile_blocks(self, seq, next_len: int | None = None):
+        """Align the last block's hash state with what may_append will need
+        for the append that takes the seq to `next_len` (default: current
+        length + 1). may_append requires: block OPEN if the new length % bs
+        in 2..bs (partial fill continues) or == 0 (it finalizes itself);
+        block FINALIZED only when new length % bs == 1 (a fresh block is
+        allocated). The spec verify/replay/restore dance around boundaries can
+        leave stale state; compute the needed state from arithmetic."""
+        bm = self.sched.block_manager
+        bs = bm.block_size
+        if not seq.block_table:
+            return
+        nl = next_len if next_len is not None else seq.num_tokens + 1
+        need_finalized = (nl % bs == 1)
+        last = bm.blocks[seq.block_table[-1]]
+        if need_finalized and last.hash == -1:
+            token_ids = seq.block(seq.num_blocks - 1)
+            prefix = bm.blocks[seq.block_table[-2]].hash if len(seq.block_table) > 1 else -1
+            h = bm.compute_hash(token_ids, prefix)
+            last.update(h, token_ids)
+            bm.hash_to_block_id[h] = last.block_id
+        elif not need_finalized and last.hash != -1:
+            if last.hash in bm.hash_to_block_id:
+                del bm.hash_to_block_id[last.hash]
+            last.reset()
 
     # ---------- spec step ----------
 
@@ -207,8 +255,8 @@ class SpecEngine2:
             kv["k"].zero_(); kv["v"].zero_(); kv["len"] = 0
         proposals = []
         pos_start = pos
-        kv_len_start = kv["len"]     # probe semantics: only FIRST call of each
-        h, tok = h_cur, tok_cur      # step keeps its cache entry (target-h based)
+        h, tok = h_cur, tok_cur
+        kv_len_start = kv["len"]
         with torch.inference_mode():
             for _ in range(k):
                 e = self.embed_w[tok].unsqueeze(0).to(torch.bfloat16)
@@ -224,10 +272,15 @@ class SpecEngine2:
         n_before = seq.num_tokens
         seq.token_ids = seq.token_ids[:-1]
         seq.num_tokens -= 1
+        self._reconcile_blocks(seq)   # first verify append starts from len n-1
         for t in [y_last] + proposals:
             seq.append_token(t)
             if not bm.can_append(seq):
                 raise RuntimeError("verify: no free KV blocks")
+            _lb = bm.blocks[seq.block_table[-1]]
+            if os.getenv("ADALLM_MTP_DEBUG"):
+                _dbg(f"verify-append len={seq.num_tokens} mod={seq.num_tokens % bm.block_size} "
+                     f"nblk={len(seq.block_table)} last.hash={_lb.hash}")
             bm.may_append(seq)
         seq.num_prefilled_tokens = n_before - 1
         seq.cur_chunk = k + 1
@@ -259,6 +312,7 @@ class SpecEngine2:
         _restore_delta(mr, self._snap[1])
         self._snap = None
 
+        self._reconcile_blocks(seq)
         # append finals to the sequence (correction last)
         eos_set = sched.eos if not seq.ignore_eos else set()
         if not isinstance(eos_set, set):
@@ -269,6 +323,16 @@ class SpecEngine2:
             seq.append_token(t)
             if not bm.can_append(seq):
                 raise RuntimeError("accept: no free KV blocks")
+            _lb = bm.blocks[seq.block_table[-1]]
+            if seq.num_tokens % bm.block_size == 1 and _lb.hash == -1:
+                # DUMP-STATE: the exact crash condition — dump everything
+                raise RuntimeError(
+                    f"DUMP-STATE accept-append bad: len={seq.num_tokens} bs={bm.block_size} "
+                    f"nblk={len(seq.block_table)} table={seq.block_table} "
+                    f"hashes={[bm.blocks[b].hash for b in seq.block_table]} "
+                    f"snap_tbl={self._snap[0]['block_table'] if self._snap else None} "
+                    f"snap_last={self._snap[0].get('last_blk') if self._snap else None} "
+                    f"n_before={n_before} finals={finals} y={y_last}")
             bm.may_append(seq)
 
         # ---- 3b. replay [y, accepted finals except correction] through the
@@ -294,6 +358,7 @@ class SpecEngine2:
             assert in_r.tolist() == replay_tokens, f"replay span {in_r.tolist()} != {replay_tokens}"
             h_replay = mr.model(in_r, pos_r)     # [a+1, H]; last row = hidden at f_acc pos
             # re-append the correction (unprocessed, as intended)
+            self._reconcile_blocks(seq)
             seq.append_token(correction_tok)
             if not bm.can_append(seq):
                 raise RuntimeError("replay-append: no free KV blocks")
@@ -301,28 +366,59 @@ class SpecEngine2:
         # after replay, everything up to (not incl) correction is processed
         seq.num_prefilled_tokens = seq.num_tokens - 1
 
-        last = seq.completion_token_ids[-1] if seq.completion_token_ids else None
-        if last is not None and last in eos_set:
-            fin, reason = True, "stop"
-        elif seq.num_completion_tokens >= seq.max_tokens:
-            fin, reason = True, "length"
-        if fin:
-            seq.finish_reason = reason
+        # ---- 3c. advance the correction through ONE plain decode step:
+        # writes its KV + delta state in decode order, yields the decode-context
+        # hidden the draft expects as pairing (measured: draft needs
+        # decode-context h; replay-prefill h alone → 10% vs 53% acceptance),
+        # and its sampled token z is a free bonus token. postprocess appends z,
+        # checks EOS/max_tokens, finishes and FREES delta slot + blocks.
+        # decode branch calls may_append at CURRENT len N (preparing the block
+        # for the unprocessed correction): need_finalized = (N % bs == 1)
+        self._reconcile_blocks(seq, next_len=seq.num_tokens)
+        seqs_d, is_dec = sched.schedule()
+        assert not is_dec and seqs_d and seqs_d[0] is seq
+        tok_ids_d = mr.run(seqs_d, is_dec)
+        sched.postprocess(seqs_d, tok_ids_d)
+
+        fin = seq.is_finished
+        reason = seq.finish_reason
+        # multi-token steps can JUMP OVER postprocess's `== max_tokens` check
+        # (e.g. 59 -> 62); enforce >= here so the seq always terminates.
+        if not fin and seq.num_completion_tokens >= seq.max_tokens:
+            seq.finish_reason = "length"
             seq.status = _SEQ_FINISHED
+            fin = True
+            reason = "length"
             try:
                 sched.running.remove(seq)
             except ValueError:
                 pass
+            # free resources exactly like postprocess does (it only cleans up
+            # seqs IT finished; this one finished in the spec path)
+            sched.block_manager.deallocate(seq)
+            if sched.delta_slots is not None and seq.delta_slot:
+                sched.delta_slots.free(seq.delta_slot)
+                seq.delta_slot = 0
+            self._kv.pop(seq.seq_id, None)
         outputs = [(seq.seq_id, seq.completion_token_ids, seq.finish_reason)] if fin else []
 
-        # ---- 4. pairing: (hidden at f_acc position, correction) — replay's
-        # last hidden = hidden of the token that PRODUCED the correction
-        self._pending = (h_replay[-1:].to(torch.bfloat16), correction)
+        # pairing: decode-context hidden of the correction's forward (captured
+        # by the run_model wrapper during 3c) + the NEW last token z
+        h_pair = self._capture_hidden[-1:].to(torch.bfloat16) if self._capture_hidden is not None else h_replay[-1:].to(torch.bfloat16)
+        tok_pair = seq.token_ids[-1]
+        if not fin:
+            self._pending = (h_pair, tok_pair)
         if os.getenv("ADALLM_MTP_DEBUG"):
             _dbg(f"acc={accepted} finals={finals} y={y_last} props={proposals} "
                  f"seq_len={seq.num_tokens} corr_pos={seq.num_tokens-1}")
-        # draft KV trim to accepted prefix (probe semantics)
-        kv["len"] = min(kv["len"], pos_start + accepted)
+        # draft KV trim (slot-indexed!): slot j holds the entry written by the
+        # j-th draft call ever (this seq), at rope position offset+j where
+        # offset is fixed at cache creation. This step's chain wrote k entries
+        # at slots kv_len_start..kv_len_start+k-1 (for y,p1..pk at consecutive
+        # rope positions). Keep entries for TRUE tokens only: y (slot
+        # kv_len_start) and accepted proposals (next `accepted` slots). Drop
+        # the rest (rejected hypotheticals + stale).
+        kv["len"] = min(kv["len"], kv_len_start + accepted + 1)
 
         self.stats["spec_steps"] += 1
         self.stats["tokens"] += len(finals)
