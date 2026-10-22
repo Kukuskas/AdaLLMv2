@@ -55,4 +55,6 @@ export ADALLM_CHUNK_BUDGET=${ADALLM_CHUNK_BUDGET:-4096}
 export ADALLM_DELTA_CHUNK=${ADALLM_DELTA_CHUNK:-1}   # chunked delta-net prefill kernel (4x)
 export ADALLM_MLP_NO_CAT=${ADALLM_MLP_NO_CAT:-1}     # silu(g)*u without cat round-trip
 export ADALLM_EMBED_FP8=${ADALLM_EMBED_FP8:-1}       # embedding fp8 (2.4->1.19 GiB, byte-identical outputs)
+# --- round5-b (2026-10-22): parallel prefill — mixed workloads 78->168 tok/s ---
+export ADALLM_PARALLEL_PREFILL=${ADALLM_PARALLEL_PREFILL:-1}
 exec "$VENV/bin/python" -m adallm.cli serve "$MODEL" --host "$HOST" --port "$PORT" "${EXTRA[@]}"
