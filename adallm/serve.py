@@ -358,6 +358,7 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
                 # with reasoning text and no '<think>' marker will ever appear.
                 in_thinking = prompt.rstrip().endswith("<think>")
                 started_thinking = in_thinking
+                just_closed = False  # strip leading newlines of first content chunk
                 while True:
                     kind, token_id = q.get()
                     if kind == "error":
@@ -368,9 +369,20 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
                     if not text:
                         continue
                     pending += text
-                    # We may straddle a marker boundary; hold back a tail that
-                    # could be the start of '<think>' or '</think>'.
-                    holdback = min(len(pending), 8)
+                    # Hold back only a suffix that could be the START of a marker
+                    # ('<think>' = 7 chars, '</think>' = 8 chars). Computing the
+                    # true longest-marker-prefix suffix guarantees the scanner
+                    # below always sees complete markers in `emit`.
+                    _markers = ("<think>", "</think>")
+                    holdback = 0
+                    for _mlen in (7, 8):
+                        for _p in range(1, _mlen):
+                            if len(pending) >= _p and any(
+                                m.startswith(pending[-_p:]) for m in _markers if len(m) == _mlen
+                            ):
+                                holdback = max(holdback, _p)
+                    if holdback >= len(pending):
+                        continue  # whole buffer is a potential marker prefix
                     emit, tail = pending[:-holdback] if holdback else pending, pending[-holdback:] if holdback else ""
                     if not sent_role:
                         chunk = {
@@ -393,6 +405,9 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
                             idx = emit.find("<think>")
                             if idx == -1:
                                 if emit:
+                                    if just_closed:
+                                        emit = emit.lstrip("\n")
+                                        just_closed = False
                                     out = {"content": emit}
                                     chunk = {
                                         "id": stream_id,
@@ -432,6 +447,7 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
                                 break
                             emit = emit[idx + 8:]
                             in_thinking = False
+                            just_closed = True
                     pending = tail
                 # flush remainder: re-scan for a '</think>' boundary that may
                 # live inside the held-back tail (e.g. '...</think>\n\n4' must
