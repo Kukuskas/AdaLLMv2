@@ -23,9 +23,13 @@ while [[ $# -gt 0 ]]; do
             EXTRA+=("$1" "$2"); shift 2 ;;
         --enforce-eager|--no-fp8-decode-kernel-enabled|--fp8-decode-kernel-enabled)
             EXTRA+=("$1"); shift ;;
-        # llama.cpp-style params mm-go may inject: ignore
-        --ctx-size|--ctx|--ngl|--n-gpu-layers|--parallel|--flash-attn|--reasoning)
+        # llama.cpp-style params mm-go may inject: ignore (except --reasoning)
+        --ctx-size|--ctx|--ngl|--n-gpu-layers|--parallel|--flash-attn)
             shift 2 ;;
+        --reasoning)
+            # mm-go injects --reasoning on|off for benchmark thinking control.
+            # Map to env; serve.py turns it into enable_thinking template kwarg.
+            ADALLM_REASONING="$2"; export ADALLM_REASONING; shift 2 ;;
         *) shift ;;
     esac
 done

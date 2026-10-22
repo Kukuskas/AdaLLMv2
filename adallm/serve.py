@@ -44,6 +44,17 @@ class ChatCompletionRequest(BaseModel):
     chat_template_kwargs: dict | None = None
 
 
+def _default_template_kwargs() -> dict | None:
+    """Server-level default thinking control: mm-go passes --reasoning on|off
+    via the driver env (ADALLM_REASONING). off -> Qwen enable_thinking=False."""
+    r = os.getenv("ADALLM_REASONING", "").strip().lower()
+    if r == "off":
+        return {"enable_thinking": False}
+    if r == "on":
+        return {"enable_thinking": True}
+    return None
+
+
 def _build_chat_prompt(messages: list[ChatMessage], tokenizer=None, template_kwargs: dict | None = None) -> str:
     # Prefer the model's real chat template (correct <|im_start|> framing,
     # thinking control via chat_template_kwargs). Fallback: naive transcript.
@@ -331,7 +342,7 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
             print(f"[http] chat_completions ENTRY t={_th.get_ident()}", file=sys.stderr, flush=True)
         if req.n != 1:
             raise HTTPException(status_code=400, detail="Only n=1 is supported.")
-        prompt = _build_chat_prompt(req.messages, getattr(llm, "tokenizer", None), req.chat_template_kwargs)
+        prompt = _build_chat_prompt(req.messages, getattr(llm, "tokenizer", None), req.chat_template_kwargs or _default_template_kwargs())
         # max_tokens=None (client sent none) -> generate until EOS/model limit,
         # NOT the old silent default of 16 which truncated thinking models mid-thought.
         _mt = req.max_tokens if req.max_tokens is not None else min(8192, getattr(llm, "max_model_len", 8192))
