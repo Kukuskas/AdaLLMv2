@@ -388,7 +388,11 @@ class ModelRunner:
             return self.model.compute_logits(self.model(input_ids, positions))
         bs = input_ids.size(0)
         context = get_context()
-        graph_key = next(x for x in self.graph_bs if x >= bs)
+        graph_key = next((x for x in self.graph_bs if x >= bs), None)
+        if graph_key is None:
+            # bs exceeds the largest captured graph (e.g. max_num_seqs between
+            # graph shapes like 9..15) — fall back to eager rather than crash.
+            return self.model.compute_logits(self.model(input_ids, positions))
         graph, slots_buf = self.graphs[graph_key]
         graph_vars = self.graph_vars
         graph_vars["input_ids"][:bs] = input_ids
