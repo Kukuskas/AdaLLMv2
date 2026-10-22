@@ -281,10 +281,12 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
 
             def _stream():
                 seq_id, q = _submit(prompts[0], sp)
+                n_tok = 0
                 while True:
                     kind, token_id = q.get()
                     if kind in ("error", "done"):
                         break
+                    n_tok += 1
                     text = llm.tokenizer.decode([token_id], skip_special_tokens=True)
                     if not text:
                         continue
@@ -302,6 +304,18 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
                         ],
                     }
                     yield f"data: {json.dumps(chunk)}\n\n"
+                # final chunk with usage (mm-go / clients count tokens from here)
+                fchunk = {
+                    "id": stream_id, "object": "text_completion",
+                    "created": created, "model": model_name,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": _prompt_token_count(llm, prompts[0]),
+                        "completion_tokens": n_tok,
+                        "total_tokens": _prompt_token_count(llm, prompts[0]) + n_tok,
+                    },
+                }
+                yield f"data: {json.dumps(fchunk)}\n\n"
                 yield "data: [DONE]\n\n"
 
             return StreamingResponse(_stream(), media_type="text/event-stream")
@@ -342,8 +356,11 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
                     # scheduler state (the historical 'known wedge' under
                     # concurrent load). Correctness fix; behavior unchanged
                     # for single-request-at-a-time use.
+                    _ptoks = _prompt_token_count(llm, prompt)
+                    _ctoks = 0
                     with _engine_lock:
                         for _, _, text, _ in llm.generate_stream([prompt], sp):
+                            _ctoks += len(llm.tokenizer.encode(text))
                             if not text:
                                 continue
                             if not _sent_role:
@@ -356,6 +373,11 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
                                   "model": model_name,
                                   "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]}
                             yield f"data: {json.dumps(_c)}\n\n"
+                    _uc = {"id": stream_id, "object": "chat.completion", "created": created,
+                           "model": model_name, "choices": [],
+                           "usage": {"prompt_tokens": _ptoks, "completion_tokens": _ctoks,
+                                     "total_tokens": _ptoks + _ctoks}}
+                    yield f"data: {json.dumps(_uc)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
                 seq_id, q = _submit(prompt, sp)
@@ -365,12 +387,15 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
                 in_thinking = prompt.rstrip().endswith("<think>")
                 started_thinking = in_thinking
                 just_closed = False  # strip leading newlines of first content chunk
+                _ptoks = _prompt_token_count(llm, prompt)
+                _ctoks = 0
                 while True:
                     kind, token_id = q.get()
                     if kind == "error":
                         break
                     if kind == "done":
                         break
+                    _ctoks += 1
                     text = llm.tokenizer.decode([token_id], skip_special_tokens=True)
                     if not text:
                         continue
@@ -496,11 +521,13 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
                             "choices": [{"index": 0, "delta": out, "finish_reason": None}],
                         }
                         yield f"data: {json.dumps(chunk)}\n\n"
-                # final chunk with finish_reason (clients like OpenWebUI rely on it)
+                # final chunk with finish_reason + usage (mm-go reads tokens from here)
                 fchunk = {
                     "id": stream_id, "object": "chat.completion",
                     "created": created, "model": model_name,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": _ptoks, "completion_tokens": _ctoks,
+                              "total_tokens": _ptoks + _ctoks},
                 }
                 yield f"data: {json.dumps(fchunk)}\n\n"
                 yield "data: [DONE]\n\n"
