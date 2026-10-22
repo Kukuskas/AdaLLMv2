@@ -19,7 +19,7 @@ from adallm.hf_utils import resolve_model_path
 class CompletionRequest(BaseModel):
     model: str | None = None
     prompt: str | list[str]
-    max_tokens: int = 16
+    max_tokens: int | None = None
     temperature: float = 1.0
     seed: int | None = None
     ignore_eos: bool = False
@@ -35,7 +35,7 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str | None = None
     messages: list[ChatMessage]
-    max_tokens: int = 16
+    max_tokens: int | None = None  # None = model/context limit; 16 was silently truncating thinking models
     temperature: float = 1.0
     seed: int | None = None
     ignore_eos: bool = False
@@ -264,9 +264,12 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
         if req.n != 1:
             raise HTTPException(status_code=400, detail="Only n=1 is supported.")
         prompts = req.prompt if isinstance(req.prompt, list) else [req.prompt]
+        # max_tokens=None (client sent none) -> generate until EOS/model limit,
+        # NOT the old silent default of 16 which truncated thinking models mid-thought.
+        _mt = req.max_tokens if req.max_tokens is not None else min(8192, getattr(llm, "max_model_len", 8192))
         sp = SamplingParams(
             temperature=req.temperature,
-            max_tokens=req.max_tokens,
+            max_tokens=_mt,
             ignore_eos=req.ignore_eos,
             seed=req.seed,
         )
@@ -315,9 +318,12 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
         if req.n != 1:
             raise HTTPException(status_code=400, detail="Only n=1 is supported.")
         prompt = _build_chat_prompt(req.messages, getattr(llm, "tokenizer", None), req.chat_template_kwargs)
+        # max_tokens=None (client sent none) -> generate until EOS/model limit,
+        # NOT the old silent default of 16 which truncated thinking models mid-thought.
+        _mt = req.max_tokens if req.max_tokens is not None else min(8192, getattr(llm, "max_model_len", 8192))
         sp = SamplingParams(
             temperature=req.temperature,
-            max_tokens=req.max_tokens,
+            max_tokens=_mt,
             ignore_eos=req.ignore_eos,
             seed=req.seed,
         )
