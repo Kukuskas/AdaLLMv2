@@ -22,6 +22,8 @@ exact.
 from __future__ import annotations
 
 import os
+import time
+
 import torch
 
 from adallm.architectures.mtp_draft import MTPDraft, load_mtp
@@ -76,9 +78,14 @@ class SpecEngine2:
         self.sched = llm.scheduler
         self.mr = llm.model_runner
         self.k = int(os.getenv("ADALLM_MTP_K", "3"))
+        # Round7-A A/B debug switch: force the old restore+replay path even on
+        # full accept (measurement only; default off = fast path enabled).
+        self._slowpath = bool(os.getenv("ADALLM_MTP_SLOWPATH"))
         self.stats = {"spec_steps": 0, "plain_steps": 0, "tokens": 0,
                       "draft_accepted": 0, "draft_total": 0, "fallbacks": 0,
-                      "p1_hit": 0, "p1_total": 0}
+                      "p1_hit": 0, "p1_total": 0, "full_accept": 0,
+                      "t_draft": 0.0, "t_verify": 0.0, "t_restore": 0.0,
+                      "t_replay": 0.0, "t_3c": 0.0}
         dev = torch.device("cuda:0")
         self.draft = MTPDraft(max_position=16384).to(dev).to(torch.bfloat16)
         load_mtp(self.draft, self.mr.config.model, dev, torch.bfloat16)
@@ -128,6 +135,16 @@ class SpecEngine2:
                     out = self._spec(running[0])
                 except Exception as e:
                     _dbg(f"spec failed: {e!r}; restore+plain")
+                    if os.getenv("ADALLM_MTP_DEBUG"):
+                        import traceback
+                        traceback.print_exc()
+                        s = running[0]
+                        bm_ = self.sched.block_manager
+                        print(f"[mtp2-fb] len={s.num_tokens} bs={bm_.block_size} "
+                              f"tbl={len(s.block_table)} snap={'yes' if self._snap else 'none'} "
+                              f"npf={s.num_prefilled_tokens} chunk={s.cur_chunk} "
+                              f"in_chunked={s in self.sched.chunked} "
+                              f"in_running={s in self.sched.running}", flush=True)
                     self.stats["fallbacks"] += 1
                     if self._snap:
                         try:
@@ -144,8 +161,17 @@ class SpecEngine2:
                     out = self._plain()
             else:
                 out = self._plain()
-        # after plain decode step, refresh pairing from captured hidden
-        if self._capture_hidden is not None and out is not None and out[1] < 0:
+        # after plain decode/prefill step, refresh pairing from captured hidden
+        if self._capture_hidden is not None and out is not None and out[1] != 0:
+            # Round7-A: also refresh after a FINAL prefill chunk (out[1] > 0).
+            # Previously only decode steps (out[1] < 0) refreshed, so on every
+            # request AFTER the first, the first spec step ran with the
+            # PREVIOUS request's stale (h, tok) pair — junk drafts and an
+            # acceptance dip on step 1. capture_hidden[-1] is the hidden of the
+            # last prompt token; postprocess has appended the first sampled
+            # token, so (h, last_token) is the exact MTP pairing. Intermediate
+            # chunks are excluded: their seq is still in `chunked`, not
+            # `running`.
             seqs = [s for s in sched.running if not s.is_finished]
             if seqs:
                 s = seqs[0]
@@ -271,6 +297,7 @@ class SpecEngine2:
         pos_start = pos
         h, tok = h_cur, tok_cur
         kv_len_start = kv["len"]
+        _t0 = time.perf_counter()
         with torch.inference_mode():
             for _ in range(k):
                 e = self.embed_w[tok].unsqueeze(0).to(torch.bfloat16)
@@ -279,6 +306,7 @@ class SpecEngine2:
                 proposals.append(tok)
                 h = dh
                 pos += 1
+        torch.cuda.synchronize(); self.stats["t_draft"] += time.perf_counter() - _t0
 
         # ---- 2. verify (span always [y, p1..pk] = k+1, bounded) ----
         self._snap = (self._snap_seq(seq), _snapshot_delta(mr, seq.delta_slot))
@@ -306,10 +334,26 @@ class SpecEngine2:
         seqs_now, is_prefill = sched.schedule()
         assert is_prefill and seqs_now and seqs_now[0] is seq and len(seqs_now) == 1
         input_ids, positions = mr.prepare_prefill(seqs_now)
+        _t0 = time.perf_counter()
         with torch.inference_mode():
             hidden = mr.model(input_ids, positions)          # [k+1, H]
             logits = hidden.to(self.lm_head_w.dtype) @ self.lm_head_w.t()
+        torch.cuda.synchronize(); self.stats["t_verify"] += time.perf_counter() - _t0
         t_greedy = logits.argmax(dim=-1).tolist()            # row i predicts span[i+1]
+        if os.getenv("ADALLM_MTP_DEBUG_TIE"):
+            # Round7-A diagnostic: verify logits are fp32 (hidden @ W fp32)
+            # while plain decode uses bf16 F.linear — near-ties can argmax
+            # differently. Count flips + top-2 margins when enabled.
+            lg16 = (hidden.to(torch.bfloat16) @ self.mr.model.lm_head.weight.detach().t()
+                    if hasattr(self.mr.model, "lm_head") else None)
+            if lg16 is not None:
+                t16 = lg16.float().argmax(dim=-1).tolist()
+                top2 = logits.float().topk(2, dim=-1)
+                for i, (a, b) in enumerate(zip(t_greedy, t16)):
+                    if a != b:
+                        m = (top2.values[i, 0] - top2.values[i, 1]).item()
+                        print(f"[mtp2-tie] row{i}: fp32={a} bf16={b} top2_margin={m:.4f}",
+                              flush=True)
 
         # ---- 3. accept ----
         accepted = 0
@@ -331,40 +375,103 @@ class SpecEngine2:
                     finals = finals[: _i + 1]
                     break
 
-        # restore to pre-verify state
-        self._restore_seq(seq, self._snap[0])
-        _restore_delta(mr, self._snap[1])
-        self._snap = None
+        # Round7-A: exact max_tokens enforcement — a multi-token step can jump
+        # OVER the limit (e.g. 79 -> 83 with the old `>=`-only check leaving
+        # 81-83 tokens emitted). Truncate finals so the step lands on it
+        # exactly; if the limit is reached before the correction, 3c (and its
+        # bonus z) is skipped via the length short-circuit below.
+        # NOTE: seq currently holds the VERIFY span [y, p1..pk] — k proposals
+        # beyond n_before — so subtract k to get the true emitted-so-far count.
+        _room = seq.max_tokens - (seq.num_completion_tokens - k)
+        if _room > 0 and len(finals) > _room:
+            finals = finals[:_room]
 
-        self._reconcile_blocks(seq)
+        # Round7-A: on FULL accept (accepted == k) the verify forward already
+        # processed [y, p1..pk] and left delta+KV state correct through p_k.
+        # The slow path's restore+replay would re-feed the exact same tokens
+        # at the same positions from the same (restored) state — bit-identical
+        # writes — so they are pure waste (~290ms of the ~320ms eager step).
+        # Only the correction is unprocessed: append it WITHOUT a forward and
+        # jump straight to the 3c decode step (which writes its KV+delta in
+        # decode order and provides the decode-context pairing hidden).
+        full = accepted == k and len(finals) == k + 1 and not self._slowpath
+        h_replay = None
         # append finals to the sequence (correction last)
         eos_set = sched.eos if not seq.ignore_eos else set()
         if not isinstance(eos_set, set):
             eos_set = {eos_set}
         fin = False
         reason = None
-        for t in finals:
-            seq.append_token(t)
+        if full:
+            # discard the snapshot WITHOUT restoring: verify's appends are the
+            # truth now. Sequence already contains [.., y, p1..pk].
+            self._snap = None
+            _t0 = time.perf_counter()
+            self._reconcile_blocks(seq, next_len=seq.num_tokens + 1)
+            seq.append_token(correction)
             if not bm.can_append(seq):
-                raise RuntimeError("accept: no free KV blocks")
-            _lb = bm.blocks[seq.block_table[-1]]
-            if seq.num_tokens % bm.block_size == 1 and _lb.hash == -1:
-                # DUMP-STATE: the exact crash condition — dump everything
-                raise RuntimeError(
-                    f"DUMP-STATE accept-append bad: len={seq.num_tokens} bs={bm.block_size} "
-                    f"nblk={len(seq.block_table)} table={seq.block_table} "
-                    f"hashes={[bm.blocks[b].hash for b in seq.block_table]} "
-                    f"snap_tbl={self._snap[0]['block_table'] if self._snap else None} "
-                    f"snap_last={self._snap[0].get('last_blk') if self._snap else None} "
-                    f"n_before={n_before} finals={finals} y={y_last}")
+                raise RuntimeError("fastpath correction append: no free KV blocks")
             bm.may_append(seq)
+            # invariant: everything except the newest token processed —
+            # correction's KV row is stale garbage, but nothing reads it
+            # before the 3c decode below overwrites it (same slot/position).
+            seq.num_prefilled_tokens = seq.num_tokens - 1
+            torch.cuda.synchronize(); self.stats["t_restore"] += time.perf_counter() - _t0
+            self.stats["full_accept"] += 1
+        else:
+            # restore to pre-verify state
+            _t0 = time.perf_counter()
+            self._restore_seq(seq, self._snap[0])
+            _restore_delta(mr, self._snap[1])
+            self._snap = None
+
+            # Round7-A boundary fix (pre-existing bug): a restore at
+            # len % bs == 1 is LAGGED — the block for the unprocessed tail
+            # token is not yet in the table (plain protocol allocates it in
+            # the decode that processes that token). The accept-append loop's
+            # may_append only allocates when an append lands at %bs == 1;
+            # starting from %bs == 1 the first append lands at %bs == 2, so
+            # positions past the boundary never get a block and replay's
+            # prepare_prefill IndexErrors (observed: 72/73 spec steps fell
+            # back permanently after the first boundary crossing). Finalize
+            # the full last block and pre-allocate the tail block.
+            if (seq.num_tokens % bm.block_size == 1
+                    and len(seq.block_table) == seq.num_blocks - 1):
+                self._reconcile_blocks(seq, next_len=seq.num_tokens)  # finalize full last
+                nb = bm._allocate_block(bm.free_block_ids[0])
+                nb.precision = bm._precision_for_block_index(
+                    len(seq.block_table), len(seq.block_table) + 1)
+                seq.block_table.append(nb.block_id)
+            else:
+                self._reconcile_blocks(seq)
+            for t in finals:
+                seq.append_token(t)
+                if not bm.can_append(seq):
+                    raise RuntimeError("accept: no free KV blocks")
+                _lb = bm.blocks[seq.block_table[-1]]
+                if seq.num_tokens % bm.block_size == 1 and _lb.hash == -1:
+                    # DUMP-STATE: the exact crash condition — dump everything
+                    raise RuntimeError(
+                        f"DUMP-STATE accept-append bad: len={seq.num_tokens} bs={bm.block_size} "
+                        f"nblk={len(seq.block_table)} table={seq.block_table} "
+                        f"hashes={[bm.blocks[b].hash for b in seq.block_table]} "
+                        f"snap_tbl={self._snap[0]['block_table'] if self._snap else None} "
+                        f"snap_last={self._snap[0].get('last_blk') if self._snap else None} "
+                        f"n_before={n_before} finals={finals} y={y_last}")
+                bm.may_append(seq)
+            torch.cuda.synchronize(); self.stats["t_restore"] += time.perf_counter() - _t0
 
         # Round6-B: EOS short-circuit — if the last final is EOS the seq is
         # done; replay/3c are pointless (no further tokens needed) and the
         # upstream code never checks EOS on finals (only on z in 3c), so
         # without this the seq would decode all the way to max_tokens.
-        if not seq.ignore_eos and finals and finals[-1] in eos_set:
-            seq.finish_reason = "stop"
+        # Round7-A: also short-circuit when the (possibly truncated) finals
+        # land exactly on max_tokens — running 3c anyway would emit bonus
+        # token z and overshoot the limit (81 of 80).
+        _hit_len = seq.num_completion_tokens >= seq.max_tokens
+        if ((not seq.ignore_eos and finals and finals[-1] in eos_set) or _hit_len):
+            seq.finish_reason = "stop" if (finals and finals[-1] in eos_set
+                                           and not seq.ignore_eos) else "length"
             seq.status = _SEQ_FINISHED
             try:
                 sched.running.remove(seq)
@@ -387,33 +494,38 @@ class SpecEngine2:
         # ---- 3b. replay [y, accepted finals except correction] through the
         # target so the delta state contains exactly the accepted tokens in
         # order; correction stays UNprocessed (next verify feeds it).
-        replay_tokens = [y_last] + finals[:-1]
-        with torch.inference_mode():
-            # pop the correction so schedule() recomputes the chunk as exactly
-            # [y, f1..f_acc] (it derives span from len(seq) - num_prefilled)
-            correction_tok = seq.token_ids.pop()
-            seq.num_tokens -= 1
-            seq.last_token = seq.token_ids[-1]
-            seq.num_prefilled_tokens = n_before - 1
-            seq.cur_chunk = len(replay_tokens)
-            try:
-                sched.running.remove(seq)   # avoid double membership (running+chunked)
-            except ValueError:
-                pass
-            sched.chunked.append(seq)
-            seqs_r, is_p = sched.schedule()
-            assert is_p and seqs_r and seqs_r[0] is seq
-            in_r, pos_r = mr.prepare_prefill(seqs_r)
-            assert in_r.tolist() == replay_tokens, f"replay span {in_r.tolist()} != {replay_tokens}"
-            h_replay = mr.model(in_r, pos_r)     # [a+1, H]; last row = hidden at f_acc pos
-            # re-append the correction (unprocessed, as intended)
-            self._reconcile_blocks(seq)
-            seq.append_token(correction_tok)
-            if not bm.can_append(seq):
-                raise RuntimeError("replay-append: no free KV blocks")
-            bm.may_append(seq)
-        # after replay, everything up to (not incl) correction is processed
-        seq.num_prefilled_tokens = seq.num_tokens - 1
+        # Round7-A: SKIPPED on full accept — verify already produced those
+        # exact writes; only the correction (appended above) is unprocessed.
+        if not full:
+            _t0 = time.perf_counter()
+            replay_tokens = [y_last] + finals[:-1]
+            with torch.inference_mode():
+                # pop the correction so schedule() recomputes the chunk as exactly
+                # [y, f1..f_acc] (it derives span from len(seq) - num_prefilled)
+                correction_tok = seq.token_ids.pop()
+                seq.num_tokens -= 1
+                seq.last_token = seq.token_ids[-1]
+                seq.num_prefilled_tokens = n_before - 1
+                seq.cur_chunk = len(replay_tokens)
+                try:
+                    sched.running.remove(seq)   # avoid double membership (running+chunked)
+                except ValueError:
+                    pass
+                sched.chunked.append(seq)
+                seqs_r, is_p = sched.schedule()
+                assert is_p and seqs_r and seqs_r[0] is seq
+                in_r, pos_r = mr.prepare_prefill(seqs_r)
+                assert in_r.tolist() == replay_tokens, f"replay span {in_r.tolist()} != {replay_tokens}"
+                h_replay = mr.model(in_r, pos_r)     # [a+1, H]; last row = hidden at f_acc pos
+                # re-append the correction (unprocessed, as intended)
+                self._reconcile_blocks(seq)
+                seq.append_token(correction_tok)
+                if not bm.can_append(seq):
+                    raise RuntimeError("replay-append: no free KV blocks")
+                bm.may_append(seq)
+            # after replay, everything up to (not incl) correction is processed
+            seq.num_prefilled_tokens = seq.num_tokens - 1
+            torch.cuda.synchronize(); self.stats["t_replay"] += time.perf_counter() - _t0
 
         # ---- 3c. advance the correction through ONE plain decode step:
         # writes its KV + delta state in decode order, yields the decode-context
@@ -423,13 +535,33 @@ class SpecEngine2:
         # checks EOS/max_tokens, finishes and FREES delta slot + blocks.
         # decode branch calls may_append at CURRENT len N (preparing the block
         # for the unprocessed correction): need_finalized = (N % bs == 1)
+        # Round7-A wrong-slot fix: at N % bs == 1 the decode-append protocol
+        # expects the table LAGGED (len num_blocks-1, last block finalized) —
+        # schedule's may_append then allocates the final block and
+        # prepare_decode maps the slot correctly. Our explicit append above
+        # left it CURRENT (extra open block allocated): undo that allocation,
+        # else may_append allocates one block TOO MANY and the correction's
+        # KV silently lands in the wrong block (position N-1 read as garbage).
+        if seq.num_tokens % bm.block_size == 1 and len(seq.block_table) == seq.num_blocks:
+            blk = seq.block_table.pop()
+            _b = bm.blocks[blk]
+            if _b.hash != -1:
+                bm.hash_to_block_id.pop(_b.hash, None)
+            _b.reset()
+            if blk not in bm.free_block_ids:
+                bm.free_block_ids.append(blk)
+        # invariant: entering the decode schedule, table covers exactly the
+        # blocks may_append will need (lagged by one iff N % bs == 1)
+        assert len(seq.block_table) == seq.num_blocks - (seq.num_tokens % bm.block_size == 1)
         self._reconcile_blocks(seq, next_len=seq.num_tokens)
+        _t0 = time.perf_counter()
         seqs_d, is_dec = sched.schedule()
         assert not is_dec and seqs_d and seqs_d[0] is seq
         tok_ids_d = mr.run(seqs_d, is_dec)
         # Round6-B: keep z's postprocess updates for the fan-out (EOS/max_tokens
         # on the bonus token are checked there as usual).
         updates_d = sched.postprocess(seqs_d, tok_ids_d)
+        torch.cuda.synchronize(); self.stats["t_3c"] += time.perf_counter() - _t0
 
         fin = seq.is_finished
         reason = seq.finish_reason
@@ -455,7 +587,12 @@ class SpecEngine2:
 
         # pairing: decode-context hidden of the correction's forward (captured
         # by the run_model wrapper during 3c) + the NEW last token z
-        h_pair = self._capture_hidden[-1:].to(torch.bfloat16) if self._capture_hidden is not None else h_replay[-1:].to(torch.bfloat16)
+        if self._capture_hidden is not None:
+            h_pair = self._capture_hidden[-1:].to(torch.bfloat16)
+        elif h_replay is not None:
+            h_pair = h_replay[-1:].to(torch.bfloat16)
+        else:
+            raise RuntimeError("no pairing hidden: 3c capture missing on fast path")
         tok_pair = seq.token_ids[-1]
         if not fin:
             self._pending = (h_pair, tok_pair)
