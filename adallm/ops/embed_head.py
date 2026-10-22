@@ -54,6 +54,14 @@ class ParallelLMHead(VocabParallelEmbedding):
         super().__init__(num_embeddings, embedding_dim)
 
     def forward(self, x: torch.Tensor):
+        marlin = getattr(self, "_marlin_lmhead", None)
+        if marlin is not None:
+            context = get_context()
+            if context.is_prefill:
+                last_indices = context.cu_seqlens_q[1:] - 1
+                x = x[last_indices].contiguous()
+            from adallm.ops.lmhead_marlin import lmhead_marlin_linear
+            return lmhead_marlin_linear(self, x)
         context = get_context()
         if context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
