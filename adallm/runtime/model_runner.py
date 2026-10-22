@@ -7,6 +7,12 @@ import torch
 # thread (cudaHostAlloc cross-thread contention). Main thread may pin; the
 # serve engine thread must not.
 _PIN = os.getenv("ADALLM_NO_PIN", "") != "1"
+# Round4-B (default OFF): capture lm_head + sampler into the decode CUDA
+# graphs (ADALLM_GRAPH_SAMPLE=1). Today only self.model() is captured;
+# compute_logits (marlin lm_head) + the ~8-kernel eager sampler run outside
+# the graph every decode step.
+_GRAPH_SAMPLE_ENV = os.getenv("ADALLM_GRAPH_SAMPLE", "0").strip().lower()
+GRAPH_SAMPLE_ENABLED = _GRAPH_SAMPLE_ENV not in ("0", "false", "off", "")
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
@@ -394,14 +400,32 @@ class ModelRunner:
         graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
         slots_buf[:bs] = context.delta_slots[:bs]
         slots_buf[bs:] = 0    # padding rows → NULL slot (kernels skip them)
+        if GRAPH_SAMPLE_ENABLED:
+            # Round4-B: the graph captured model+lm_head+sampler; copy the
+            # sampled token ids out of the graph's static buffer.
+            graph.replay()
+            return graph_vars["sample_ids"][:bs]
         graph.replay()
         return self.model.compute_logits(graph_vars["outputs"][:bs])
 
+    @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        if self.rank == 0:
+            temperatures = self.prepare_sample(seqs)
+            if GRAPH_SAMPLE_ENABLED and not is_prefill and not self.enforce_eager and len(seqs) <= 512:
+                # copy into the graph's static buffer (fp32, length max graph bs)
+                gv = self.graph_vars
+                gv["temperatures"].fill_(1.0)
+                gv["temperatures"][: len(seqs)] = temperatures
+                out = self.run_model(input_ids, positions, is_prefill)
+                token_ids = out.tolist()
+            else:
+                logits = self.run_model(input_ids, positions, is_prefill)
+                token_ids = self.sampler(logits, temperatures).tolist()
+        else:
+            self.run_model(input_ids, positions, is_prefill)
+            token_ids = None
         if is_prefill and token_ids is not None:
             # intermediate chunked-prefill chunks advance the cursor only
             token_ids = [tid if seq.chunk_final else -1 for seq, tid in zip(seqs, token_ids)]
@@ -423,6 +447,9 @@ class ModelRunner:
         self.graph_bs = [bs for bs in ([1, 2, 4, 8] + list(range(16, max_bs + 1, 16))) if bs <= max_bs]
         self.graphs = {}
         self.graph_pool = None
+        # Round4-B: static buffers for in-graph lm_head + sampler
+        sample_ids = torch.zeros(max_bs, dtype=torch.int64)
+        temperatures = torch.ones(max_bs, dtype=torch.float32)
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
@@ -432,8 +459,16 @@ class ModelRunner:
             self.graph_delta_slots[:bs] = 0    # all NULL during capture warmup
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs], max_seqlen_k=config.max_model_len, delta_slots=slots_buf)
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            if GRAPH_SAMPLE_ENABLED:
+                logits = self.model.compute_logits(outputs[:bs])         # warmup
+                self.sampler(logits, temperatures[:bs])
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+                if GRAPH_SAMPLE_ENABLED:
+                    # lm_head + sampler inside the graph (Round4-B): removes
+                    # ~15 eager kernel launches + their gaps per decode step.
+                    logits = self.model.compute_logits(outputs[:bs])
+                    sample_ids[:bs] = self.sampler(logits, temperatures[:bs])
             self.graphs[bs] = (graph, slots_buf)
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
@@ -447,4 +482,6 @@ class ModelRunner:
             context_lens=context_lens,
             block_tables=block_tables,
             outputs=outputs,
+            sample_ids=sample_ids,
+            temperatures=temperatures,
         )

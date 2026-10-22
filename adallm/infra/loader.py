@@ -389,7 +389,8 @@ def load_model(model: nn.Module, path: str):
     # unless NVFP4_FP8_BCOL is on, which is incompatible with Marlin)
     _marlin_on = os.getenv("ADALLM_MARLIN", "0").strip().lower() not in ("0", "false", "off", "")
     _tinygemm_on = os.getenv("ADALLM_TINYGEMM", "0").strip().lower() not in ("0", "false", "off", "")
-    if _marlin_on or _tinygemm_on:
+    _deq_shapes_on = bool(os.getenv("ADALLM_DEQ_SHAPES", "").strip())
+    if _marlin_on or _tinygemm_on or _deq_shapes_on:
         from adallm.ops.marlin import repack_model
         repack_model(model)
     # lm_head NVFP4+Marlin repack (round2-C; off by default, env-gated)
@@ -406,6 +407,28 @@ def load_model(model: nn.Module, path: str):
         # the quantize+repack spike (transient fp32 chunks) poisons the CUDA
         # peak-memory high-water mark used for KV pool sizing → reset it
         torch.cuda.reset_peak_memory_stats()
+    # embedding FP8 row-wise quantization (round4-B; off by default, env-gated)
+    if os.getenv("ADALLM_EMBED_FP8", "0").strip().lower() not in ("0", "false", "off", ""):
+        from adallm.ops.embed_fp8 import repack_embed
+        embed = getattr(getattr(model, "model", None), "language_model", None)
+        embed = getattr(embed, "embed_tokens", None) if embed is not None else None
+        if embed is None:
+            for m in model.modules():
+                from adallm.ops.embed_head import VocabParallelEmbedding
+                if isinstance(m, VocabParallelEmbedding) and m.weight.numel() > 0:
+                    embed = m
+                    break
+        if embed is None:
+            print("[embed-fp8] no embedding found; skip", flush=True)
+        elif getattr(model, "config", None) is not None and getattr(model.config, "tie_word_embeddings", False):
+            print("[embed-fp8] tie_word_embeddings=True; skip", flush=True)
+        else:
+            lm_head_w = getattr(getattr(model, "lm_head", None), "weight", None)
+            if lm_head_w is not None and lm_head_w.numel() > 0 and embed.weight.data_ptr() == lm_head_w.data_ptr():
+                print("[embed-fp8] embedding shares storage with lm_head; skip", flush=True)
+            else:
+                repack_embed(embed)
+                torch.cuda.reset_peak_memory_stats()
 
 
 def _init_nvfp4_bcol_scales(model: nn.Module):
