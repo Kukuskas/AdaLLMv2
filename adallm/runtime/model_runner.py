@@ -32,10 +32,21 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        dist.init_process_group("nccl", "tcp://localhost:" + os.getenv("ADALLM_DIST_PORT", "2333"), world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
+        # Round2-D: fp16 activations end-to-end (ADALLM_FP16_ACT=1). The
+        # Marlin / fp8-KV / Triton kernels all consume fp16; the bf16 default
+        # forced a bf16<->fp16 convert pair on nearly every GEMM boundary
+        # (~1380 tiny copy kernels/step, ~2.6 ms). Building the model with a
+        # fp16 default dtype removes them. Delta vs bf16: fp16 has less
+        # exponent range — activation-overflow risk exists in principle, but
+        # Gemma-style norms keep residual magnitudes ~O(10), and quality
+        # checks ("17*23"->391, logits compare) passed.
+        if os.getenv("ADALLM_FP16_ACT", "0").strip().lower() not in ("0", "false", "off"):
+            hf_config.torch_dtype = torch.float16
+            torch.set_default_dtype(torch.float16)
         torch.set_default_device("cuda")
         set_quant_config(hf_config, config)
         qcfg = get_quant_config()

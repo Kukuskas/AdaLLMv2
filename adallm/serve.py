@@ -1,6 +1,7 @@
 import json
-import faulthandler
 import os
+import sys
+import faulthandler
 import signal
 import time
 import uuid
@@ -190,6 +191,8 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
                     break
                 for seq_id, token_id, finished in updates:
                     q = _queues.get(seq_id)
+                    if os.getenv("ADALLM_DEBUG_STEP"):
+                        print(f"[engine] update seq={seq_id} tok={token_id} fin={finished} q={'Y' if q is not None else 'MISSING'}", file=sys.stderr, flush=True)
                     if q is not None:
                         if token_id != -1:
                             q.put(("token", token_id))
@@ -223,6 +226,9 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
             return llm.generate(prompts, sp, use_tqdm=False)
 
     def _submit(prompt: str, sp) -> tuple[int, _queue.Queue]:
+        if os.getenv("ADALLM_DEBUG_STEP"):
+            import threading as _th
+            print(f"[submit] ENTER t={_th.get_ident()}", file=sys.stderr, flush=True)
         with _req_lock:
             if isinstance(prompt, str):
                 ids = llm.tokenizer.encode(prompt)
@@ -233,7 +239,11 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
             llm.scheduler.add(seq)
             q: _queue.Queue = _queue.Queue()
             _queues[seq.seq_id] = q
+        if os.getenv("ADALLM_DEBUG_STEP"):
+            print(f"[submit] seq {seq.seq_id} queued, waking engine", file=sys.stderr, flush=True)
         _wakeup.set()
+        if os.getenv("ADALLM_DEBUG_STEP"):
+            print(f"[submit] seq {seq.seq_id} wakeup set", file=sys.stderr, flush=True)
         return seq.seq_id, q
 
     @app.get("/v1/health")
@@ -299,6 +309,9 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     def chat_completions(req: ChatCompletionRequest) -> dict[str, Any]:
+        if os.getenv("ADALLM_DEBUG_STEP"):
+            import threading as _th
+            print(f"[http] chat_completions ENTRY t={_th.get_ident()}", file=sys.stderr, flush=True)
         if req.n != 1:
             raise HTTPException(status_code=400, detail="Only n=1 is supported.")
         prompt = _build_chat_prompt(req.messages, getattr(llm, "tokenizer", None), req.chat_template_kwargs)
@@ -318,20 +331,25 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
                 started_thinking = False
                 pending = ""    # small buffer to detect <think>/</think> markers
                 if not _use_queue_server:
-                    _sent_role = False
-                    for _, _, text, _ in llm.generate_stream([prompt], sp):
-                        if not text:
-                            continue
-                        if not _sent_role:
+                    # Round3-B: serialize with non-streaming requests. Two
+                    # threads stepping the engine concurrently corrupts
+                    # scheduler state (the historical 'known wedge' under
+                    # concurrent load). Correctness fix; behavior unchanged
+                    # for single-request-at-a-time use.
+                    with _engine_lock:
+                        for _, _, text, _ in llm.generate_stream([prompt], sp):
+                            if not text:
+                                continue
+                            if not _sent_role:
+                                _c = {"id": stream_id, "object": "chat.completion", "created": created,
+                                      "model": model_name,
+                                      "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
+                                yield f"data: {json.dumps(_c)}\n\n"
+                                _sent_role = True
                             _c = {"id": stream_id, "object": "chat.completion", "created": created,
                                   "model": model_name,
-                                  "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
+                                  "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]}
                             yield f"data: {json.dumps(_c)}\n\n"
-                            _sent_role = True
-                        _c = {"id": stream_id, "object": "chat.completion", "created": created,
-                              "model": model_name,
-                              "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]}
-                        yield f"data: {json.dumps(_c)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
                 seq_id, q = _submit(prompt, sp)
@@ -463,6 +481,7 @@ def serve(
         fp8_decode_kernel_min_ctx=fp8_decode_kernel_min_ctx,
     )
     app = _build_app(llm, model)
-    # SIGUSR1 dumps all thread tracebacks (debug wedges without py-spy)
-    faulthandler.register(signal.SIGUSR1, all_threads=True)
+    # SIGUSR1 dumps all thread tracebacks to a file (full, not truncated by uvicorn stderr)
+    _dump_fh = open(os.path.expanduser("~/adallm-fault-dump.txt"), "w")
+    faulthandler.register(signal.SIGUSR1, file=_dump_fh, all_threads=True)
     uvicorn.run(app, host=host, port=port)

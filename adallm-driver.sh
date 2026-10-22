@@ -36,7 +36,8 @@ if [[ -z "$MODEL" || -z "$PORT" ]]; then
 fi
 
 export ADALLM_QUIET=0
-export NVFP4_FP8=1       # FP8 GEMM fast path (verified working)
+export NVFP4_FP8=${NVFP4_FP8:-1}       # FP8 GEMM fast path (Triton mode only)
+export ADALLM_MARLIN=${ADALLM_MARLIN:-1}  # Marlin NVFP4 kernel: 22.9 tok/s single-stream (vs 9.8)
 export ADALLM_NO_COMPILE=1   # inductor fork-pool deadlocks under server load
 export ADALLM_NO_PIN=1       # pinned allocs from engine thread can deadlock
 export CUDA_DEVICE_ORDER=PCI_BUS_ID

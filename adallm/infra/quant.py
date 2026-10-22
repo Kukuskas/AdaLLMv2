@@ -48,7 +48,7 @@ def set_quant_config(hf_config, config) -> None:
         try:
             group_size = qc["config_groups"]["group_0"]["weights"]["group_size"]
         except Exception:
-            group_size = None
+            group_size = qc.get("group_size") if not isinstance(qc.get("group_size"), dict) else None
         try:
             kv_bits = qc["kv_cache_scheme"]["num_bits"]
         except Exception:
@@ -59,7 +59,27 @@ def set_quant_config(hf_config, config) -> None:
         if algo is None and qc.get("format") == "nvfp4-pack-quantized":
             algo = "NVFP4"
 
-    _QUANT_CONFIG.enabled = (algo == "NVFP4")
+        # airagrp-style QAT checkpoints: flat dict {mode: "nvfp4", bits: 4,
+        # group_size: 16} with no algo/format fields.
+        if algo is None and qc.get("mode") == "nvfp4" and qc.get("bits") == 4:
+            algo = "NVFP4"
+
+        # NVIDIA ModelOpt mixed-precision (FP8 delta-attn + NVFP4 MLP) and
+        # compressed-tensors "mixed-precision" (unsloth). Both carry NVFP4
+        # group_1 with group_size 16; FP8 groups are handled at load time.
+        if algo in (None, "MIXED_PRECISION") and qc.get("format") == "mixed-precision":
+            algo = "NVFP4_MIXED"
+        if algo == "MIXED_PRECISION":
+            algo = "NVFP4_MIXED"
+        if algo == "NVFP4_MIXED":
+            try:
+                gsz = qc["config_groups"]["group_1"]["weights"]["group_size"]
+                if group_size is None:
+                    group_size = gsz
+            except Exception:
+                pass
+
+    _QUANT_CONFIG.enabled = (algo in ("NVFP4", "NVFP4_MIXED"))
     _QUANT_CONFIG.algo = algo
     if group_size is not None:
         _QUANT_CONFIG.group_size = int(group_size)

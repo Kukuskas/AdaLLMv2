@@ -91,9 +91,18 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self, return_updates: bool = False):
+        _dbg = os.getenv("ADALLM_DEBUG_STEP", "")
+        if _dbg:
+            print(f"[step] schedule() start", file=sys.stderr, flush=True)
         seqs, is_prefill = self.scheduler.schedule()
+        if _dbg:
+            print(f"[step] schedule() done n={len(seqs)} prefill={is_prefill}", file=sys.stderr, flush=True)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
+        if _dbg:
+            print(f"[step] model run done", file=sys.stderr, flush=True)
         updates = self.scheduler.postprocess(seqs, token_ids)
+        if _dbg:
+            print(f"[step] postprocess done", file=sys.stderr, flush=True)
         outputs = [
             (seq.seq_id, seq.completion_token_ids, seq.finish_reason)
             for seq in seqs if seq.is_finished

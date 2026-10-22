@@ -1,3 +1,4 @@
+import os
 from collections import deque
 
 from adallm.settings import Config
@@ -6,11 +7,41 @@ from adallm.runtime.block_manager import BlockManager
 from adallm.runtime.delta_slots import DeltaSlotManager
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 class Scheduler:
 
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        # ---- Round3-B: decode/prefill interleave (env-gated, default OFF) ----
+        # ADALLM_INTERLEAVE=N (N>0): when decode seqs are RUNNING and prefill
+        # work is pending, run at most one prefill step every N scheduler
+        # steps (N-1 decode steps between prefill chunks). N=0 => legacy
+        # prefill-priority (decode starves for a whole chunk duration).
+        self.interleave_every = max(0, _env_int("ADALLM_INTERLEAVE", 0))
+        # ADALLM_CHUNK_BUDGET: max tokens per prefill chunk per step.
+        # 0 => legacy (chunk up to max_num_batched_tokens). When INTERLEAVE
+        # is on without an explicit budget, default to 4096 so a waiting
+        # decode waits at most one small chunk, not a 16K-token monster.
+        _cb = _env_int("ADALLM_CHUNK_BUDGET", 0)
+        if _cb > 0:
+            self.chunk_budget = min(_cb, self.max_num_batched_tokens)
+        elif self.interleave_every > 0:
+            self.chunk_budget = min(4096, self.max_num_batched_tokens)
+        else:
+            self.chunk_budget = self.max_num_batched_tokens
+        self._decode_steps_since_prefill = 1 << 30    # admit prefill initially
+        # Round3-B instrumentation: decode batch-size histogram
+        self.stats = {"prefill_steps": 0, "decode_steps": 0, "decode_bs_hist": {}}
         eos = config.eos
         if isinstance(eos, (list, tuple, set)):
             self.eos = set(eos)
@@ -46,61 +77,78 @@ class Scheduler:
     def _prefill_remaining(self, seq: Sequence) -> int:
         return len(seq) - self._prefill_start(seq)
 
+    def _prefill_admitted(self) -> bool:
+        """Round3-B: when INTERLEAVE is on, skip prefill this step if decode
+        seqs are running and we haven't run enough decode steps since the last
+        prefill. Returns True when prefill may proceed this step."""
+        if self.interleave_every <= 0 or not self.running:
+            return True
+        return self._decode_steps_since_prefill >= self.interleave_every
+
     def schedule(self) -> tuple[list[Sequence], bool]:
         # ---- chunked prefill: continue in-flight chunks, then admit new seqs ----
         scheduled: list[Sequence] = []
         num_batched_tokens = 0
 
-        # Continue partially-prefilled sequences first (FIFO, whole budget).
-        while self.chunked and num_batched_tokens < self.max_num_batched_tokens:
-            seq = self.chunked[0]
-            remaining = self._prefill_remaining(seq)
-            budget = self.max_num_batched_tokens - num_batched_tokens
-            take = min(remaining, budget)
-            final = take == remaining
-            seq.cur_chunk = take
-            seq.chunk_final = final
-            scheduled.append(seq)
-            num_batched_tokens += take
-            if final:
-                self.chunked.popleft()
-                seq.status = SequenceStatus.RUNNING
-                self.running.append(seq)
-            break    # one chunking seq per step (it eats the whole budget)
+        prefill_ok = self._prefill_admitted()
+        # Round3-B: per-step chunk budget (legacy = max_num_batched_tokens).
+        step_budget = self.chunk_budget
 
-        # Admit new sequences while budget remains.
-        while (
-            self.waiting
-            and num_batched_tokens < self.max_num_batched_tokens
-            and len(scheduled) + len(self.running) + len(self.chunked) < self.max_num_seqs
-        ):
-            seq = self.waiting[0]
-            if not self.block_manager.can_allocate(seq):
-                break
-            remaining = self._prefill_remaining(seq)
-            if remaining <= 0:
+        if prefill_ok:
+            # Continue partially-prefilled sequences first (FIFO, whole budget).
+            while self.chunked and num_batched_tokens < step_budget:
+                seq = self.chunked[0]
+                remaining = self._prefill_remaining(seq)
+                budget = step_budget - num_batched_tokens
+                take = min(remaining, budget)
+                final = take == remaining
+                seq.cur_chunk = take
+                seq.chunk_final = final
+                scheduled.append(seq)
+                num_batched_tokens += take
+                if final:
+                    self.chunked.popleft()
+                    seq.status = SequenceStatus.RUNNING
+                    self.running.append(seq)
+                break    # one chunking seq per step (it eats the whole budget)
+
+            # Admit new sequences while budget remains.
+            while (
+                self.waiting
+                and num_batched_tokens < step_budget
+                and len(scheduled) + len(self.running) + len(self.chunked) < self.max_num_seqs
+            ):
+                seq = self.waiting[0]
+                if not self.block_manager.can_allocate(seq):
+                    break
+                remaining = self._prefill_remaining(seq)
+                if remaining <= 0:
+                    self.waiting.popleft()
+                    continue
+                self.block_manager.allocate(seq)
+                if self.delta_slots is not None:
+                    seq.delta_slot = self.delta_slots.alloc()
+                budget = step_budget - num_batched_tokens
+                take = min(remaining, budget)
+                final = take == remaining
+                seq.cur_chunk = take
+                seq.chunk_final = final
+                scheduled.append(seq)
+                num_batched_tokens += take
                 self.waiting.popleft()
-                continue
-            self.block_manager.allocate(seq)
-            if self.delta_slots is not None:
-                seq.delta_slot = self.delta_slots.alloc()
-            budget = self.max_num_batched_tokens - num_batched_tokens
-            take = min(remaining, budget)
-            final = take == remaining
-            seq.cur_chunk = take
-            seq.chunk_final = final
-            scheduled.append(seq)
-            num_batched_tokens += take
-            self.waiting.popleft()
-            if final:
-                seq.status = SequenceStatus.RUNNING
-                self.running.append(seq)
-            else:
-                seq.status = SequenceStatus.RUNNING
-                self.chunked.append(seq)
+                if final:
+                    seq.status = SequenceStatus.RUNNING
+                    self.running.append(seq)
+                else:
+                    seq.status = SequenceStatus.RUNNING
+                    self.chunked.append(seq)
 
         if scheduled:
+            self._decode_steps_since_prefill = 0
+            self.stats["prefill_steps"] += 1
             return scheduled, True
+
+        self._decode_steps_since_prefill += 1
 
         # ---- decode ----
         if not self.running and (self.chunked or self.waiting):
@@ -130,6 +178,8 @@ class Scheduler:
                 scheduled.append(seq)
         assert scheduled
         self.running.extendleft(reversed(scheduled))
+        self.stats["decode_steps"] += 1
+        self.stats["decode_bs_hist"][len(scheduled)] = self.stats["decode_bs_hist"].get(len(scheduled), 0) + 1
         return scheduled, False
 
     def preempt(self, seq: Sequence):
@@ -164,5 +214,5 @@ class Scheduler:
                     seq.delta_slot = 0
                 if seq in self.running:
                     self.running.remove(seq)
-            updates.append((seq.seq_id, token_id, finished))
+            updates.append((seq.seq_id, token_id, seq.status == SequenceStatus.FINISHED))
         return updates

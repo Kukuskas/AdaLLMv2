@@ -23,7 +23,7 @@ from adallm.architectures.qwen3 import (
 from adallm.architectures.qwen3 import Qwen3MLP
 from adallm.ops.attention import Attention
 from adallm.ops.layernorm import RMSNorm, GemmaRMSNorm
-from adallm.ops.linear import RowParallelLinear, ReplicatedLinear
+from adallm.ops.linear import RowParallelLinear, ReplicatedLinear, pair_linear
 from adallm.infra.context import get_context
 
 try:
@@ -138,9 +138,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         mixed_qkv = self.in_proj_qkv(hidden_states)   # [T, key_dim*2 + value_dim]
         z = self.in_proj_z(hidden_states)             # [T, value_dim]
-        b = self.in_proj_b(hidden_states)             # [T, num_v_heads]
-        a = self.in_proj_a(hidden_states)             # [T, num_v_heads]
-
+        b, a = pair_linear(self.in_proj_b, self.in_proj_a, hidden_states)
+        b = b.view(-1, self.num_v_heads)
+        a = a.view(-1, self.num_v_heads)
         if context.is_prefill:
             # ---- varlen prefill (chunked): cu_seqlens_q is chunk-relative ----
             cu = context.cu_seqlens_q
@@ -263,8 +263,9 @@ class Qwen3_5Attention(nn.Module):
         q, gate = q_out.split(self.head_dim, dim=-1)
         gate = gate.reshape(-1, self.num_heads * self.head_dim)
         q = self.q_norm(q)
-        k = self.k_norm(self.k_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim))
-        v = self.v_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
+        k_proj_out, v_proj_out = pair_linear(self.k_proj, self.v_proj, hidden_states)
+        k = self.k_norm(k_proj_out.view(-1, self.num_kv_heads, self.head_dim))
+        v = v_proj_out.view(-1, self.num_kv_heads, self.head_dim)
         cos, sin = self.rotary_emb(positions)
         if cos.dim() == 3 and cos.shape[0] == 1:
             cos = cos[0]
@@ -302,6 +303,7 @@ class Qwen3_5MLP(nn.Module):
 class Qwen3_5DecoderLayer(nn.Module):
     def __init__(self, config, layer_idx: int, max_position: int | None = None):
         super().__init__()
+        self.layer_idx = layer_idx
         self.layer_type = config.layer_types[layer_idx]
         if self.layer_type == "linear_attention":
             self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx)
@@ -329,6 +331,11 @@ class Qwen3_5DecoderLayer(nn.Module):
         if isinstance(hidden_states, tuple):
             hidden_states, _ = hidden_states
         hidden_states = hidden_states + residual
+        import os as _os
+        if _os.getenv("ADALLM_DEBUG_LAYERS"):
+            _s = hidden_states.detach().float().std().item()
+            _m = hidden_states.detach().float().abs().max().item()
+            print(f"[layer {self.layer_idx}] std={_s:.5f} absmax={_m:.4f}", flush=True)
         return hidden_states, residual
 
 
