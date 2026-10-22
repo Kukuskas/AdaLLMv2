@@ -312,6 +312,23 @@ class ModelRunner:
         block_tables = None
         delta_slots = []
         for seq in seqs:
+            if seq.cur_chunk == -1 and len(seq) > seq.num_prompt_tokens:
+                # Round5-B decode rider piggybacked into a prefill step:
+                # process exactly the last token against full context —
+                # mathematically identical to the decode path (same slot,
+                # same position, same delta state semantics).
+                input_ids.append(seq.last_token)
+                positions.append(len(seq) - 1)
+                cu_seqlens_q.append(cu_seqlens_q[-1] + 1)
+                cu_seqlens_k.append(cu_seqlens_k[-1] + len(seq))
+                max_seqlen_q = max(1, max_seqlen_q)
+                max_seqlen_k = max(len(seq), max_seqlen_k)
+                delta_slots.append(seq.delta_slot)
+                if seq.block_table:
+                    slot_mapping.append(
+                        seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
+                    )
+                continue
             start = seq.num_cached_tokens + seq.num_prefilled_tokens
             chunk = seq.cur_chunk if seq.cur_chunk > 0 else len(seq) - start
             input_ids.extend(seq[start : start + chunk])
@@ -322,7 +339,12 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if seq.delta_slot > 0 and seq.num_prefilled_tokens == 0 and seq.num_cached_tokens == 0:
+            if (
+                seq.delta_slot > 0
+                and seq.num_prefilled_tokens == 0
+                and seq.num_cached_tokens == 0
+                and len(seq) == seq.num_prompt_tokens
+            ):
                 self._reset_delta_slot(seq.delta_slot)    # fresh seq: zero recycled state
             delta_slots.append(seq.delta_slot)
             if not seq.block_table:    # warmup
@@ -448,7 +470,13 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [bs for bs in ([1, 2, 4, 8] + list(range(16, max_bs + 1, 16))) if bs <= max_bs]
+        # Round5-B: always capture a graph at exactly max_bs so decode batches
+        # of bs 9..max_bs (e.g. max_num_seqs=10) don't silently fall back to
+        # eager (~2x slower decode; measured 85 vs 182 tok/s agg at bs 10/8).
+        bs_list = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        if max_bs not in bs_list:
+            bs_list.append(max_bs)
+        self.graph_bs = [bs for bs in bs_list if bs <= max_bs]
         self.graphs = {}
         self.graph_pool = None
         # Round4-B: static buffers for in-graph lm_head + sampler
