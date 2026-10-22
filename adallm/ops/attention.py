@@ -1,3 +1,5 @@
+import os
+
 import torch
 from torch import nn
 import triton
@@ -6,6 +8,10 @@ import triton.language as tl
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from adallm.infra.context import get_context
 from adallm.infra.quant import get_quant_config
+
+# Split-K flash-decode for fp8 KV (round2-c): opt-in via ADALLM_ATTN_SPLITK=1;
+# the original fp8_kv_decode_group_kernel remains the default fallback.
+_SPLITK_ENABLED = os.environ.get("ADALLM_ATTN_SPLITK", "0") == "1"
 
 
 @triton.jit
@@ -125,6 +131,288 @@ def _make_fp8_decode_autotune_configs():
 
 
 FP8_DECODE_AUTOTUNE_CONFIGS = _make_fp8_decode_autotune_configs()
+
+
+# ---------------------------------------------------------------------------
+# Split-K flash-decode kernel (round2-c). Parallelizes the KV scan across
+# MAX_SPLIT programs per (batch, kv_head); each program computes an online-
+# softmax partial (m, l, acc) over its KV block chunk; a tiny reduce kernel
+# merges partials. Split count adapts INSIDE the kernel from the on-device
+# context_lens (CUDA-graph safe). Enabled via ADALLM_ATTN_SPLITK=1.
+# ---------------------------------------------------------------------------
+@triton.jit
+def fp8_kv_decode_splitk_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    pm_ptr,
+    pl_ptr,
+    pacc_ptr,
+    block_table_ptr,
+    context_lens_ptr,
+    scale,
+    stride_qb,
+    stride_qh,
+    stride_qd,
+    stride_kb,
+    stride_kt,
+    stride_kh,
+    stride_kd,
+    stride_vb,
+    stride_vt,
+    stride_vh,
+    stride_vd,
+    stride_pm_b,
+    stride_pm_h,
+    stride_pacc_b,
+    stride_pacc_h,
+    stride_pacc_s,
+    stride_pacc_q,
+    stride_pacc_d,
+    stride_bt,
+    B,
+    MAX_BLOCKS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    Q_PER_KV: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    MAX_SPLIT: tl.constexpr,
+    WINDOW_SIZE: tl.constexpr,
+    TOKENS_PER_SPLIT_MIN: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    kv_h = tl.program_id(1)
+    pid_s = tl.program_id(2)
+    q_idx0 = tl.arange(0, BLOCK_Q)
+    h0 = kv_h * Q_PER_KV + q_idx0
+    mask_h0 = (q_idx0 < Q_PER_KV) & (h0 < NUM_HEADS)
+    d0 = tl.arange(0, HEAD_DIM)
+    blk_lo = 0
+    blk_hi = -1
+    tok_lo = 0
+    tok_hi = -1
+    empty = 1
+    if pid_b < B:
+        ctx_len = tl.load(context_lens_ptr + pid_b)
+        if ctx_len > 0:
+            if WINDOW_SIZE > 0:
+                start = tl.maximum(ctx_len - WINDOW_SIZE, 0)
+                start_block = start // BLOCK_SIZE
+            else:
+                start = 0
+                start_block = 0
+            end_block = (ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+            num_tokens = ctx_len - start
+            num_blocks = end_block - start_block
+            nsplit = (num_tokens + TOKENS_PER_SPLIT_MIN - 1) // TOKENS_PER_SPLIT_MIN
+            nsplit = tl.minimum(nsplit, MAX_SPLIT)
+            chunk_blocks = (num_blocks + nsplit - 1) // nsplit
+            blk_lo = start_block + pid_s * chunk_blocks
+            blk_hi = tl.minimum(blk_lo + chunk_blocks, end_block)
+            tok_lo = tl.maximum(start, blk_lo * BLOCK_SIZE)
+            tok_hi = tl.minimum(ctx_len, blk_hi * BLOCK_SIZE)
+            if (pid_s < nsplit) & (blk_lo < blk_hi) & (tok_lo < tok_hi):
+                empty = 0
+
+    if empty == 1:
+        # Identity partial so the reducer never sees uninitialized memory.
+        m_id = tl.full((BLOCK_Q,), -float("inf"), tl.float32)
+        l_id = tl.zeros((BLOCK_Q,), tl.float32)
+        a_id = tl.zeros((BLOCK_Q, HEAD_DIM), tl.float32)
+        tl.store(pm_ptr + pid_b * stride_pm_b + kv_h * stride_pm_h + pid_s * BLOCK_Q + q_idx0, m_id, mask=mask_h0)
+        tl.store(pl_ptr + pid_b * stride_pm_b + kv_h * stride_pm_h + pid_s * BLOCK_Q + q_idx0, l_id, mask=mask_h0)
+        tl.store(
+            pacc_ptr + pid_b * stride_pacc_b + kv_h * stride_pacc_h + pid_s * stride_pacc_s
+            + q_idx0[:, None] * stride_pacc_q + d0[None, :] * stride_pacc_d,
+            a_id,
+            mask=mask_h0[:, None] & (d0[None, :] < HEAD_DIM),
+        )
+        return
+
+    q_idx = tl.arange(0, BLOCK_Q)
+    h = kv_h * Q_PER_KV + q_idx
+    mask_h = (q_idx < Q_PER_KV) & (h < NUM_HEADS)
+    d = tl.arange(0, HEAD_DIM)
+    q = tl.load(
+        q_ptr + pid_b * stride_qb + h[:, None] * stride_qh + d[None, :] * stride_qd,
+        mask=mask_h[:, None] & (d[None, :] < HEAD_DIM),
+        other=0,
+    ).to(tl.float16)
+
+    m = tl.full((BLOCK_Q,), -float("inf"), tl.float32)
+    l = tl.zeros((BLOCK_Q,), tl.float32)
+    acc = tl.zeros((BLOCK_Q, HEAD_DIM), tl.float32)
+
+    for blk in range(blk_lo, blk_hi):
+        blk_valid = blk < MAX_BLOCKS
+        block_id = tl.load(block_table_ptr + pid_b * stride_bt + blk, mask=blk_valid, other=0)
+        token_base = blk * BLOCK_SIZE
+        for off in tl.static_range(0, BLOCK_SIZE, BLOCK_T):
+            t = tl.arange(0, BLOCK_T)
+            token_idx = token_base + off + t
+            mask_t = (token_idx >= tok_lo) & (token_idx < tok_hi) & blk_valid & (block_id >= 0)
+            k_t = tl.load(
+                k_ptr + block_id * stride_kb + kv_h * stride_kh + (off + t)[None, :] * stride_kt + d[:, None] * stride_kd,
+                mask=mask_t[None, :] & (d[:, None] < HEAD_DIM),
+                other=0.0,
+            ).to(tl.float16)
+            v_t = tl.load(
+                v_ptr + block_id * stride_vb + kv_h * stride_vh + (off + t)[:, None] * stride_vt + d[None, :] * stride_vd,
+                mask=mask_t[:, None] & (d[None, :] < HEAD_DIM),
+                other=0.0,
+            ).to(tl.float16)
+            scores = tl.dot(q, k_t) * scale
+            scores = tl.where(mask_t[None, :], scores, -float("inf"))
+            scores = tl.where(mask_h[:, None], scores, -float("inf"))
+            block_m = tl.max(scores, axis=1)
+            m_new = tl.maximum(m, block_m)
+            m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+            exp_scores = tl.exp(scores - m_safe[:, None])
+            exp_scores = tl.where(m_new[:, None] == -float("inf"), 0.0, exp_scores)
+            exp_scores_fp16 = exp_scores.to(tl.float16)
+            alpha = tl.exp(m - m_safe)
+            l = l * alpha + tl.sum(exp_scores, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(exp_scores_fp16, v_t)
+            m = m_new
+
+    tl.store(pm_ptr + pid_b * stride_pm_b + kv_h * stride_pm_h + pid_s * BLOCK_Q + q_idx, m, mask=mask_h)
+    tl.store(pl_ptr + pid_b * stride_pm_b + kv_h * stride_pm_h + pid_s * BLOCK_Q + q_idx, l, mask=mask_h)
+    tl.store(
+        pacc_ptr + pid_b * stride_pacc_b + kv_h * stride_pacc_h + pid_s * stride_pacc_s
+        + q_idx[:, None] * stride_pacc_q + d[None, :] * stride_pacc_d,
+        acc,
+        mask=mask_h[:, None] & (d[None, :] < HEAD_DIM),
+    )
+
+
+@triton.jit
+def splitk_reduce_kernel(
+    pm_ptr,
+    pl_ptr,
+    pacc_ptr,
+    out_ptr,
+    stride_pm_b,
+    stride_pm_h,
+    stride_pacc_b,
+    stride_pacc_h,
+    stride_pacc_s,
+    stride_pacc_q,
+    stride_pacc_d,
+    stride_ob,
+    stride_oh,
+    stride_od,
+    B,
+    HEAD_DIM: tl.constexpr,
+    Q_PER_KV: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    MAX_SPLIT: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    h = tl.program_id(1)
+    if pid_b >= B:
+        return
+    kv_h = h // Q_PER_KV
+    local_q = h % Q_PER_KV
+    d = tl.arange(0, HEAD_DIM)
+
+    pm_base = pid_b * stride_pm_b + kv_h * stride_pm_h + local_q
+    pacc_base = pid_b * stride_pacc_b + kv_h * stride_pacc_h + local_q * stride_pacc_q
+
+    m_max = -float("inf")
+    for s in tl.static_range(0, MAX_SPLIT):
+        m_s = tl.load(pm_ptr + pm_base + s * BLOCK_Q)
+        m_max = tl.maximum(m_max, m_s)
+
+    l_tot = 0.0
+    acc = tl.zeros((HEAD_DIM,), tl.float32)
+    for s in tl.static_range(0, MAX_SPLIT):
+        m_s = tl.load(pm_ptr + pm_base + s * BLOCK_Q)
+        l_s = tl.load(pl_ptr + pm_base + s * BLOCK_Q)
+        a_s = tl.load(pacc_ptr + pacc_base + s * stride_pacc_s + d * stride_pacc_d)
+        w = tl.exp(m_s - m_max)
+        l_tot += l_s * w
+        acc += a_s * w
+
+    out = acc / l_tot
+    tl.store(out_ptr + pid_b * stride_ob + h * stride_oh + d * stride_od, out.to(tl.float16), mask=d < HEAD_DIM)
+
+
+def fp8_kv_decode_splitk(
+    q,
+    k_cache,
+    v_cache,
+    block_tables,
+    context_lens,
+    scale,
+    window_tokens=0,
+    max_split=64,
+    block_t=32,
+    tokens_per_split_min=1024,
+):
+    """Split-K flash-decode over fp8 KV cache. Same contract as
+    fp8_kv_decode_group_kernel's call site: returns [bs, num_heads, head_dim]
+    fp16 with GQA broadcast folded in."""
+    bs, num_heads, head_dim = q.shape
+    num_kv_heads = k_cache.shape[2]
+    block_size = k_cache.shape[1]
+    q_per_kv = num_heads // num_kv_heads
+    block_q = 1 << (q_per_kv - 1).bit_length()
+    dev = q.device
+    pm = torch.empty(bs, num_kv_heads, max_split, block_q, device=dev, dtype=torch.float32)
+    pl = torch.empty(bs, num_kv_heads, max_split, block_q, device=dev, dtype=torch.float32)
+    pacc = torch.empty(bs, num_kv_heads, max_split, block_q, head_dim, device=dev, dtype=torch.float32)
+    out = torch.empty(bs, num_heads, head_dim, device=dev, dtype=torch.float16)
+    fp8_kv_decode_splitk_kernel[(bs, num_kv_heads, max_split)](
+        q,
+        k_cache,
+        v_cache,
+        pm,
+        pl,
+        pacc,
+        block_tables,
+        context_lens,
+        scale,
+        q.stride(0), q.stride(1), q.stride(2),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
+        pm.stride(0), pm.stride(1),
+        pacc.stride(0), pacc.stride(1), pacc.stride(2), pacc.stride(3), pacc.stride(4),
+        block_tables.stride(0),
+        bs,
+        MAX_BLOCKS=block_tables.shape[1],
+        BLOCK_SIZE=block_size,
+        HEAD_DIM=head_dim,
+        NUM_HEADS=num_heads,
+        NUM_KV_HEADS=num_kv_heads,
+        Q_PER_KV=q_per_kv,
+        BLOCK_Q=block_q,
+        BLOCK_T=block_t,
+        MAX_SPLIT=max_split,
+        WINDOW_SIZE=window_tokens,
+        TOKENS_PER_SPLIT_MIN=tokens_per_split_min,
+        num_warps=4,
+        num_stages=1,
+    )
+    splitk_reduce_kernel[(bs, num_heads)](
+        pm, pl, pacc, out,
+        pm.stride(0), pm.stride(1),
+        pacc.stride(0), pacc.stride(1), pacc.stride(2), pacc.stride(3), pacc.stride(4),
+        out.stride(0), out.stride(1), out.stride(2),
+        bs,
+        HEAD_DIM=head_dim,
+        Q_PER_KV=q_per_kv,
+        NUM_HEADS=num_heads,
+        BLOCK_Q=block_q,
+        MAX_SPLIT=max_split,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out
+
 
 
 @triton.autotune(
@@ -368,6 +656,24 @@ class Attention(nn.Module):
                 try:
                     bs = q.shape[0]
                     q_contig = q.contiguous()
+                    block_size = k_cache.shape[1]
+                    head_dim = q_contig.shape[-1]
+                    num_heads = q_contig.shape[1]
+                    num_kv_heads = k_cache.shape[2]
+                    q_per_kv = num_heads // num_kv_heads
+                    if _SPLITK_ENABLED:
+                        o = fp8_kv_decode_splitk(
+                            q_contig,
+                            k_cache,
+                            v_cache,
+                            context.block_tables,
+                            context.context_lens,
+                            self.scale,
+                            window_tokens=window_tokens,
+                        )
+                        if o.dtype != orig_dtype:
+                            o = o.to(orig_dtype)
+                        return o
                     out = torch.empty_like(q_contig, dtype=torch.float16)
                     block_size = k_cache.shape[1]
                     head_dim = q_contig.shape[-1]

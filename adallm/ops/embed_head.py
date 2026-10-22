@@ -32,6 +32,12 @@ class VocabParallelEmbedding(nn.Module):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor):
+        fp8 = getattr(self, "_fp8_embed", None)
+        if fp8 is not None and self.tp_size == 1:
+            # Round4-B: fp8 row-wise table (ADALLM_EMBED_FP8=1). Only the
+            # gathered rows are dequantized (tiny), not the table.
+            from adallm.ops.embed_fp8 import embed_fp8_lookup
+            return embed_fp8_lookup(self, x).to(fp8.get("orig_dtype", torch.float16))
         if self.tp_size > 1:
             mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
             x = mask * (x - self.vocab_start_idx)
@@ -54,6 +60,14 @@ class ParallelLMHead(VocabParallelEmbedding):
         super().__init__(num_embeddings, embedding_dim)
 
     def forward(self, x: torch.Tensor):
+        marlin = getattr(self, "_marlin_lmhead", None)
+        if marlin is not None:
+            context = get_context()
+            if context.is_prefill:
+                last_indices = context.cu_seqlens_q[1:] - 1
+                x = x[last_indices].contiguous()
+            from adallm.ops.lmhead_marlin import lmhead_marlin_linear
+            return lmhead_marlin_linear(self, x)
         context = get_context()
         if context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1

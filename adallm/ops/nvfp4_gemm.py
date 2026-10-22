@@ -374,6 +374,202 @@ def nvfp4_gemm_kernel_fp8(
 
 
 @triton.jit
+def nvfp4_gemm_kernel_fp8_splitk(
+    A_ptr,
+    B_ptr,
+    S_ptr,
+    S2_ptr,
+    LUT_ptr,
+    B_COL_ptr,
+    C_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_sn,
+    stride_sk,
+    stride_cm,
+    stride_cn,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    SCALE_A: tl.constexpr,
+    SCALE_B: tl.constexpr,
+    SCALE_BCOL: tl.constexpr,
+):
+    # Split-K GEMM for skinny decode shapes (M<=8): each block computes a
+    # K-slice partial sum; results combined via fp32 atomics. This spreads
+    # weight streaming across all 128 SMs instead of grid_n blocks.
+    pid = tl.program_id(0)
+    grid_n = tl.cdiv(N, BLOCK_N)
+    pid_k = pid % SPLIT_K
+    pid_mn = pid // SPLIT_K
+    pid_m = pid_mn // grid_n
+    pid_n = pid_mn % grid_n
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    scale2 = tl.load(S2_ptr).to(tl.float16)
+
+    k_len = tl.cdiv(K, SPLIT_K)
+    k_start = pid_k * k_len
+    k_end = tl.minimum(k_start + k_len, K)
+
+    k = k_start
+    while k < k_end:
+        offs_k = k + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < k_end
+
+        a = tl.load(
+            A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak,
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0,
+        ).to(tl.float16)
+
+        packed_idx = offs_k >> 1
+        b_packed = tl.load(
+            B_ptr + packed_idx[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0,
+        )
+        low = b_packed & 0x0F
+        high = b_packed >> 4
+        is_high = (offs_k & 1)[:, None]
+        b_nibble = tl.where(is_high == 1, high, low)
+
+        base = tl.load(LUT_ptr + b_nibble)
+
+        scale_idx = offs_k // GROUP_SIZE
+        scale = tl.load(
+            S_ptr + scale_idx[:, None] * stride_sk + offs_n[None, :] * stride_sn,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0,
+        ).to(tl.float16)
+        b = base * scale * scale2
+
+        if SCALE_BCOL:
+            bcol = tl.load(B_COL_ptr + offs_n, mask=mask_n, other=1.0).to(tl.float32)
+            bcol = tl.where(bcol == 0, 1.0, bcol)
+            b_fp8 = (b / bcol[None, :]).to(_FP8_DTYPE)
+        elif SCALE_B:
+            bmax = tl.max(tl.abs(b), axis=0).to(tl.float32)
+            bmax = tl.where(bmax == 0, 1.0, bmax)
+            b_fp8 = (b / bmax[None, :]).to(_FP8_DTYPE)
+        else:
+            b_fp8 = b.to(_FP8_DTYPE)
+        if SCALE_A:
+            amax = tl.max(tl.abs(a), axis=1).to(tl.float32)
+            amax = tl.where(amax == 0, 1.0, amax)
+            a_fp8 = (a / amax[:, None]).to(_FP8_DTYPE)
+            if SCALE_BCOL:
+                acc += tl.dot(a_fp8, b_fp8) * (amax[:, None] * bcol[None, :])
+            elif SCALE_B:
+                acc += tl.dot(a_fp8, b_fp8) * (amax[:, None] * bmax[None, :])
+            else:
+                acc += tl.dot(a_fp8, b_fp8) * amax[:, None]
+        else:
+            a_fp8 = a.to(_FP8_DTYPE)
+            if SCALE_BCOL:
+                acc += tl.dot(a_fp8, b_fp8) * bcol[None, :]
+            elif SCALE_B:
+                acc += tl.dot(a_fp8, b_fp8) * bmax[None, :]
+            else:
+                acc += tl.dot(a_fp8, b_fp8)
+        k += BLOCK_K
+
+    tl.atomic_add(
+        C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        acc,
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+
+@triton.jit
+def nvfp4_gemv_kernel(
+    A_ptr,
+    B_ptr,
+    S_ptr,
+    S2_ptr,
+    LUT_ptr,
+    B_COL_ptr,
+    C_ptr,
+    K,
+    N,
+    stride_bk,
+    stride_bn,
+    stride_sk,
+    stride_sn,
+    stride_cn,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SCALE_BCOL: tl.constexpr,
+):
+    # M=1 decode GEMV: no tl.dot (tensor cores idle at M=1 anyway), fp32 FMA.
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    scale2 = tl.load(S2_ptr).to(tl.float16)
+
+    if SCALE_BCOL:
+        bcol = tl.load(B_COL_ptr + offs_n, mask=mask_n, other=1.0).to(tl.float32)
+        bcol = tl.where(bcol == 0, 1.0, bcol)
+
+    k = 0
+    while k < K:
+        offs_k = k + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+
+        a = tl.load(A_ptr + offs_k, mask=mask_k, other=0).to(tl.float32)
+
+        packed_idx = offs_k >> 1
+        b_packed = tl.load(
+            B_ptr + packed_idx[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0,
+        )
+        low = b_packed & 0x0F
+        high = b_packed >> 4
+        is_high = (offs_k & 1)[:, None]
+        b_nibble = tl.where(is_high == 1, high, low)
+
+        base = tl.load(LUT_ptr + b_nibble).to(tl.float32)
+
+        scale_idx = offs_k // GROUP_SIZE
+        scale = tl.load(
+            S_ptr + scale_idx[:, None] * stride_sk + offs_n[None, :] * stride_sn,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0,
+        ).to(tl.float32)
+        b = base * scale * scale2
+
+        if SCALE_BCOL:
+            b = b / bcol[None, :]
+
+        acc += tl.sum(a[:, None] * b, axis=0)
+        k += BLOCK_K
+
+    tl.atomic_add(
+        C_ptr + offs_n * stride_cn,
+        acc,
+        mask=mask_n,
+    )
+
+
+
+@triton.jit
 def nvfp4_gemm_gather_kernel(
     A_ptr,
     B_ptr,
@@ -496,6 +692,14 @@ def nvfp4_linear(
         # Decode: small M; Prefill: larger M. (Swept on RTX 4090 Oct 2026:
         # in-model best is the stock config; microbench wins don't transfer.)
         if m <= 16:
+            _ov = os.getenv("NVFP4_SMALLM_CFG", "")
+            if _ov:
+                # format: BLOCK_M,BLOCK_N,BLOCK_K,warps,stages
+                try:
+                    a = [int(v) for v in _ov.split(",")]
+                    return dict(BLOCK_M=a[0], BLOCK_N=a[1], BLOCK_K=a[2], num_warps=a[3], num_stages=a[4])
+                except Exception:
+                    pass
             return dict(BLOCK_M=16, BLOCK_N=64, BLOCK_K=64, num_warps=4, num_stages=3)
         if m <= 64:
             if k >= 8192:
@@ -506,7 +710,48 @@ def nvfp4_linear(
         return dict(BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, num_warps=8, num_stages=4)
 
     cfg = _select_config(M, N, K)
-    grid = (triton.cdiv(M, cfg["BLOCK_M"]) * triton.cdiv(N, cfg["BLOCK_N"]),)
+    _GEMV_ENV = os.getenv("NVFP4_GEMV", "0").strip().lower()
+    _gemv_on = _GEMV_ENV not in ("0", "false", "off") and M == 1
+    if _gemv_on:
+        BLOCK_N = 64
+        grid = (triton.cdiv(N, BLOCK_N),)
+        c = torch.zeros((M, N), device=x.device, dtype=torch.float32)
+        from adallm.ops.nvfp4_gemm import nvfp4_gemv_kernel as _gemv
+        _gemv[grid](
+            x_2d,
+            w_packed,
+            w_scale,
+            w_scale_2,
+            lut,
+            w_scale_col if (w_scale_col is not None and w_scale_col.numel() == N) else w_scale_2,
+            c,
+            K,
+            N,
+            w_packed.stride(0),
+            w_packed.stride(1),
+            w_scale.stride(0),
+            w_scale.stride(1),
+            c.stride(1),
+            GROUP_SIZE=group_size,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=256,
+            SCALE_BCOL=(w_scale_col is not None and w_scale_col.numel() == N),
+            num_warps=8,
+            num_stages=4,
+        )
+        if bias is not None:
+            c = c + bias.to(c.dtype)
+        return c.to(out_dtype).view(*x.shape[:-1], N)
+    _SPLITK_ENV = os.getenv("NVFP4_SPLITK", "0").strip().lower()
+    _splitk_on = _SPLITK_ENV not in ("0", "false", "off") and M <= 8
+    if _splitk_on:
+        # split-K decode path: zero-init output for atomic accumulation
+        grid_n = triton.cdiv(N, cfg["BLOCK_N"])
+        split_k = max(1, min(128 // max(grid_n, 1), 16))
+        grid = (grid_n * split_k,)
+        c = torch.zeros((M, N), device=x.device, dtype=torch.float32)
+    else:
+        grid = (triton.cdiv(M, cfg["BLOCK_M"]) * triton.cdiv(N, cfg["BLOCK_N"]),)
     if _FP8_ENABLED:
         if not _fp8_supported():
             raise RuntimeError("NVFP4_FP8 is enabled but FP8 is not supported on this device.")
@@ -514,7 +759,9 @@ def nvfp4_linear(
             use_bcol = _FP8_BCOL and w_scale_col is not None and w_scale_col.numel() == N
             if not use_bcol:
                 w_scale_col = w_scale_2
-            nvfp4_gemm_kernel_fp8[grid](
+            _kern = nvfp4_gemm_kernel_fp8_splitk if _splitk_on else nvfp4_gemm_kernel_fp8
+            _extra = {"SPLIT_K": split_k} if _splitk_on else {}
+            _kern[grid](
                 x_2d,
                 w_packed,
                 w_scale,
@@ -542,6 +789,7 @@ def nvfp4_linear(
                 SCALE_BCOL=use_bcol,
                 num_warps=cfg["num_warps"],
                 num_stages=cfg["num_stages"],
+                **_extra,
             )
         except Exception as exc:
             raise RuntimeError(

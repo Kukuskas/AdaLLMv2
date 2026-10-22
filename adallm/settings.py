@@ -140,6 +140,8 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     nvfp4_mode: str = "kernel"
+    # env override for A/B testing quant execution mode
+    # ADALLM_NVFP4_MODE=dequant forces fp16 dequant at load (slow, diagnostic)
     kv_cache_dtype: str = "fp8"
     hybrid_kv_cache: bool = False
     kv_cache_sink_blocks: int = 0
@@ -166,6 +168,10 @@ class Config:
     moe_profile_layers: tuple[int, ...] | None = None
 
     def __post_init__(self):
+        import os as _os
+        _m = _os.getenv("ADALLM_NVFP4_MODE", "")
+        if _m:
+            self.nvfp4_mode = _m
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
