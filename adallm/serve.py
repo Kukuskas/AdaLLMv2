@@ -353,6 +353,11 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
                     yield "data: [DONE]\n\n"
                     return
                 seq_id, q = _submit(prompt, sp)
+                # Qwen3.8 chat template ends with '<think>\n' — reasoning mode is
+                # already OPEN in the prompt, so the model output starts directly
+                # with reasoning text and no '<think>' marker will ever appear.
+                in_thinking = prompt.rstrip().endswith("<think>")
+                started_thinking = in_thinking
                 while True:
                     kind, token_id = q.get()
                     if kind == "error":
@@ -428,17 +433,54 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
                             emit = emit[idx + 8:]
                             in_thinking = False
                     pending = tail
-                # flush remainder
+                # flush remainder: re-scan for a '</think>' boundary that may
+                # live inside the held-back tail (e.g. '...</think>\n\n4' must
+                # split into reasoning + content, not dump all as reasoning)
                 if pending:
-                    out = {"reasoning_content": pending} if in_thinking else {"content": pending}
-                    chunk = {
-                        "id": stream_id,
-                        "object": "chat.completion",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [{"index": 0, "delta": out, "finish_reason": None}],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
+                    if in_thinking:
+                        idx = pending.find("</think>")
+                        if idx != -1:
+                            r = pending[:idx]
+                            c = pending[idx + 8:].lstrip("\n")
+                            if r:
+                                out = {"reasoning_content": r}
+                                chunk = {
+                                    "id": stream_id, "object": "chat.completion",
+                                    "created": created, "model": model_name,
+                                    "choices": [{"index": 0, "delta": out, "finish_reason": None}],
+                                }
+                                yield f"data: {json.dumps(chunk)}\n\n"
+                            if c:
+                                out = {"content": c}
+                                chunk = {
+                                    "id": stream_id, "object": "chat.completion",
+                                    "created": created, "model": model_name,
+                                    "choices": [{"index": 0, "delta": out, "finish_reason": None}],
+                                }
+                                yield f"data: {json.dumps(chunk)}\n\n"
+                        else:
+                            out = {"reasoning_content": pending}
+                            chunk = {
+                                "id": stream_id, "object": "chat.completion",
+                                "created": created, "model": model_name,
+                                "choices": [{"index": 0, "delta": out, "finish_reason": None}],
+                            }
+                            yield f"data: {json.dumps(chunk)}\n\n"
+                    else:
+                        out = {"content": pending}
+                        chunk = {
+                            "id": stream_id, "object": "chat.completion",
+                            "created": created, "model": model_name,
+                            "choices": [{"index": 0, "delta": out, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                # final chunk with finish_reason (clients like OpenWebUI rely on it)
+                fchunk = {
+                    "id": stream_id, "object": "chat.completion",
+                    "created": created, "model": model_name,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+                yield f"data: {json.dumps(fchunk)}\n\n"
                 yield "data: [DONE]\n\n"
 
             return StreamingResponse(_stream(), media_type="text/event-stream")
