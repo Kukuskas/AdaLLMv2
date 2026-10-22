@@ -51,4 +51,8 @@ export ADALLM_LMHEAD_MARLIN=${ADALLM_LMHEAD_MARLIN:-1}  # lm_head NVFP4+Marlin (
 export ADALLM_QUEUE_SERVER=${ADALLM_QUEUE_SERVER:-1}
 export ADALLM_INTERLEAVE=${ADALLM_INTERLEAVE:-2}
 export ADALLM_CHUNK_BUDGET=${ADALLM_CHUNK_BUDGET:-4096}
+# --- round4-b (2026-10-22): prefill +13-16%, -1.2GB VRAM, graph sampler ---
+export ADALLM_DELTA_CHUNK=${ADALLM_DELTA_CHUNK:-1}   # chunked delta-net prefill kernel (4x)
+export ADALLM_MLP_NO_CAT=${ADALLM_MLP_NO_CAT:-1}     # silu(g)*u without cat round-trip
+export ADALLM_EMBED_FP8=${ADALLM_EMBED_FP8:-1}       # embedding fp8 (2.4->1.19 GiB, byte-identical outputs)
 exec "$VENV/bin/python" -m adallm.cli serve "$MODEL" --host "$HOST" --port "$PORT" "${EXTRA[@]}"
