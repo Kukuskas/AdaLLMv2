@@ -247,3 +247,25 @@ registry achieves this cleanly).
 - **Phase 2 (~2 weeks)**: splitK attention backend port.
 - **Phase 3 (~1 week)**: lm-head Marlin logits processor; optional
   `adallm_nvfp4` custom quant config for native QAT checkpoints.
+
+## First GPU milestone result (2026-10-23, GPU1, alongside prod)
+
+- `test_cpu_reference_selfconsistent` PASS
+- `test_marlin_matches_dequant_reference` FAIL when run directly: rel err 4.3e-2 vs 2e-2 threshold
+  (pytest run skipped it due to a skipif evaluation-order bug — marlin_vendored imported before
+  CUDA init in the collection context; direct call executes fine, see below)
+- Same for `test_marlin_scale_factor_guard` (assert rel < 2e-2 fails; output is NON-zero, so the
+  scale_factor zeroing guard itself held — the error is a numerical/convention mismatch, not zeroing)
+
+### Analysis
+Reference matmul uses the SAME wq/s as the marlin path, so quant noise cancels — 4.3% is a real
+convention difference. Suspects, in order:
+1. `_FakeLinear` scale conventions differ from adallm's real Linear (adallm multiplies weight_scale
+   by a global scale_factor at load; repack may expect that already applied)
+2. marlin kernel internal tile-perm vs the reference's row-major group-of-16 layout in _quantize_nvfp4
+3. fp16 accumulate vs fp32 reference
+
+### Next step (milestone M1, blocked on this)
+Compare `marlin_vendored.marlin_linear` against adallm's ORIGINAL `ops/marlin.py` call path with the
+exact same inputs (import from ~/adallm-nvfp4, run both on GPU, diff outputs). If adallm-original
+matches the reference, the vendoring deltas (gptq_marlin_repack signature change!) are the bug.
