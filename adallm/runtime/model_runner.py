@@ -58,9 +58,9 @@ class ModelRunner:
         qcfg = get_quant_config()
         if not qcfg.enabled:
             raise RuntimeError("NVFP4-only runtime: quantization config is not NVFP4.")
-        if qcfg.kv_cache_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
-            raise RuntimeError("NVFP4-only runtime: KV cache must be FP8.")
-        if not qcfg.fp8_decode_kernel_enabled:
+        if qcfg.kv_cache_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2, torch.float16, torch.bfloat16):
+            raise RuntimeError("NVFP4-only runtime: KV cache must be FP8 or fp16/bf16.")
+        if qcfg.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and not qcfg.fp8_decode_kernel_enabled:
             raise RuntimeError("NVFP4-only runtime: fp8_decode_kernel_enabled must be True.")
         hf_config.moe_offload_experts = bool(getattr(config, "moe_offload_experts", False))
         hf_config.moe_gpu_expert_capacity = int(getattr(config, "moe_gpu_expert_capacity", 0))
@@ -218,21 +218,28 @@ class ModelRunner:
         self.delta_modules = delta_modules
         self.graph_delta_slots = torch.zeros(num_delta_slots, dtype=torch.int64, device=self.kv_cache.device)
         layer_id = 0
+        import os as _os
+        self.kv_shadow_enabled = bool(_os.environ.get("ADALLM_KV_SHADOW"))
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 module.layer_id = layer_id
+                if self.kv_shadow_enabled and kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    module.k_shadow = torch.zeros_like(module.k_cache, dtype=torch.float16)
+                    module.v_shadow = torch.zeros_like(module.v_cache, dtype=torch.float16)
                 layer_id += 1
 
     def fp8_decode_selftest(self):
         if self.enforce_eager:
             # Still compile once to fail fast on kernel issues.
             pass
-        from adallm.ops.attention import fp8_kv_decode_group_kernel
         qcfg = get_quant_config()
+        if qcfg.kv_cache_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+            return  # fp16/bf16 KV cache: decode uses flash paged path, nothing to selftest
         if not qcfg.fp8_decode_kernel_enabled:
             raise RuntimeError("FP8 decode kernel is disabled; this runtime requires it.")
+        from adallm.ops.attention import fp8_kv_decode_group_kernel
         # Use the first attention module's cache to compile the kernel.
         attn = next(m for m in self.model.modules() if hasattr(m, "k_cache") and hasattr(m, "v_cache"))
         k_cache = attn.k_cache
