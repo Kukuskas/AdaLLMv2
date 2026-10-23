@@ -798,7 +798,7 @@ def serve(
     # MTP speculative decoding (Round5-A port to marlin-b): env-gated. Requires
     # eager mode (draft capture wrapper) and single-seq spec steps; falls back
     # silently to plain decode for concurrent batches.
-    _use_mtp = bool(os.getenv("ADALLM_MTP"))
+    _use_mtp = os.getenv("ADALLM_MTP", "").strip().lower() not in ("", "0", "false", "off")
     if _use_mtp:
         enforce_eager = True  # spec engine wraps run_model; graphs unsupported
         os.environ.setdefault("ADALLM_NO_PIN", "1")
