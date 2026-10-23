@@ -97,13 +97,19 @@ def repack_linear(module: nn.Module) -> None:
     scales_f = scales.float() * s2
 
     padded_n, padded_k = marlin_padded_nk(N, K, group_size)
-    perm = torch.empty(0, dtype=torch.int, device=dev)  # kept for 0.25 compat; unused in 0.32
     qweight = weight.detach().view(torch.int32).T.contiguous()
     qweight = marlin_pad_qweight(qweight, N, K, padded_n, padded_k)
-    marlin_qweight = _ops.gptq_marlin_repack(
-        b_q_weight=qweight, size_k=padded_k, size_n=padded_n,
-        num_bits=4, is_a_8bit=False,
-    )  # vLLM 0.32: `perm` kwarg removed (vendoring note #3)
+    perm = torch.empty(0, dtype=torch.int, device=dev)
+    try:
+        marlin_qweight = _ops.gptq_marlin_repack(  # vLLM >= 0.32 (perm removed)
+            b_q_weight=qweight, size_k=padded_k, size_n=padded_n,
+            num_bits=4, is_a_8bit=False,
+        )
+    except TypeError:
+        marlin_qweight = _ops.gptq_marlin_repack(  # vLLM <= 0.31 (perm kwarg)
+            b_q_weight=qweight, perm=perm, size_k=padded_k, size_n=padded_n,
+            num_bits=4, is_a_8bit=False,
+        )
 
     ws = scales_f.T.contiguous().to(torch.float16)
     ws = marlin_pad_scales(ws, N, K, padded_n, padded_k, group_size)
