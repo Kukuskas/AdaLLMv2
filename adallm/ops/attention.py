@@ -12,6 +12,10 @@ from adallm.infra.quant import get_quant_config
 # Split-K flash-decode for fp8 KV (round2-c): opt-in via ADALLM_ATTN_SPLITK=1;
 # the original fp8_kv_decode_group_kernel remains the default fallback.
 _SPLITK_ENABLED = os.environ.get("ADALLM_ATTN_SPLITK", "0") == "1"
+# Round8 L1a: paged verify attention — small fp8 prefill spans (MTP verify/
+# replay, <=8 rows) attend directly over block_tables via the splitk decode
+# kernel instead of gathering the whole context KV to fp16 (~2GB @28K).
+_PAGED_VERIFY = os.environ.get("ADALLM_PAGED_VERIFY", "0") == "1"
 
 
 @triton.jit
@@ -602,6 +606,15 @@ class Attention(nn.Module):
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            # Round8-B (lever 1): shadow fp16 mirror of the fp8 KV cache.
+            # KV is append-only; store the UNquantized k/v into a parallel fp16
+            # cache so prefill-style forwards (MTP verify) can use paged flash
+            # attention over block_tables instead of the whole-context gather
+            # (_gather_kv_from_blocks: ~2GB copy + .item() loops at 28K ctx).
+            # Env-gated: ADALLM_KV_SHADOW=1.
+            sk = getattr(self, "k_shadow", None)
+            if sk is not None and sk.numel():
+                store_kvcache(k, v, sk, self.v_shadow, context.slot_mapping)
         k_cache_compute, v_cache_compute = k_cache, v_cache
         is_fp8_cache = k_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) or v_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
         if is_fp8_cache:
@@ -627,6 +640,54 @@ class Attention(nn.Module):
         if context.is_prefill:
             cu_seqlens_k = context.cu_seqlens_k
             if context.block_tables is not None:    # prefix cache
+                sk = getattr(self, "k_shadow", None)
+                if (_PAGED_VERIFY and _SPLITK_ENABLED and is_fp8_cache
+                        and q.shape[0] <= 8
+                        and context.cu_seqlens_q.numel() == 2):
+                    # Round8 L1a: paged verify — small single-seq fp8 spans
+                    # (MTP verify/replay continuation) attend over block_tables
+                    # via the splitk decode kernel with per-row lens
+                    # start+1+j (row j's own KV row was just stored by
+                    # store_kvcache above). No gather, no host sync, no extra
+                    # memory (unlike the fp16 shadow mirror).
+                    n_q = q.shape[0]
+                    base = (context.cu_seqlens_k[1] - n_q).reshape(1)
+                    lens = base + torch.arange(1, n_q + 1, device=q.device,
+                                               dtype=torch.int32)
+                    bt = context.block_tables[:1].expand(n_q, -1)
+                    o = fp8_kv_decode_splitk(
+                        q.contiguous(), k_cache, v_cache, bt, lens, self.scale,
+                        window_tokens=window_tokens)
+                    if o.dtype != orig_dtype:
+                        o = o.to(orig_dtype)
+                    return o
+                if is_fp8_cache and sk is not None and sk.numel():
+                    # Round8-B: paged flash over the fp16 shadow mirror — no
+                    # gather, no .item(), graph-friendly. The newly computed
+                    # k/v for this forward's own tokens are already stored
+                    # into the shadow by store_kvcache above, so q/k/v for
+                    # flash = shadow cache entirely (append-only semantics).
+                    k_cache_compute, v_cache_compute = sk, self.v_shadow
+                    cu_seqlens_k = context.cu_seqlens_k
+                    k, v = k_cache_compute, v_cache_compute
+                    seqused_k = None
+                    if cu_seqlens_k is not None and cu_seqlens_k.numel() >= 2:
+                        # vllm flash with block_table needs seqused_k INSTEAD of cu_seqlens_k
+                        seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+                    o = flash_attn_varlen_func(
+                        q, k, v,
+                        max_seqlen_q=context.max_seqlen_q,
+                        cu_seqlens_q=context.cu_seqlens_q,
+                        max_seqlen_k=context.max_seqlen_k,
+                        seqused_k=seqused_k,
+                        softmax_scale=self.scale,
+                        causal=True,
+                        window_size=(list(window_size) if isinstance(window_size, tuple) else window_size),
+                        block_table=context.block_tables,
+                    )
+                    if o.dtype != orig_dtype:
+                        o = o.to(orig_dtype)
+                    return o
                 if is_fp8_cache:
                     k_cache_compute, v_cache_compute, cu_seqlens_k = _gather_kv_from_blocks(
                         k_cache, v_cache, context.block_tables, context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]

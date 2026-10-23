@@ -79,12 +79,25 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
+        # Round8-D (TP=2): pickle the FULL dynamic state — rank-1 workers
+        # rebuild sequences from these pickles and their prepare_prefill /
+        # prepare_decode / postprocess need every field. The old 5-tuple
+        # predated chunked prefill, delta slots, and finish bookkeeping;
+        # each missing field crashed rank-1 with AttributeError.
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
-                self.token_ids if self.num_completion_tokens == 0 else self.last_token)
+                self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+                self.num_prefilled_tokens, self.cur_chunk, self.chunk_final,
+                self.delta_slot, self.seq_id, self.status.value,
+                self.temperature, self.max_tokens, self.ignore_eos, self.finish_reason)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
+        (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
+         tok_or_last, self.num_prefilled_tokens, self.cur_chunk, self.chunk_final,
+         self.delta_slot, self.seq_id, status, self.temperature, self.max_tokens,
+         self.ignore_eos, self.finish_reason) = state
+        self.status = SequenceStatus(status)
         if self.num_completion_tokens == 0:
-            self.token_ids = state[-1]
+            self.token_ids = tok_or_last
+            self.last_token = self.token_ids[-1] if self.token_ids else -1
         else:
-            self.last_token = state[-1]
+            self.last_token = tok_or_last

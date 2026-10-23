@@ -58,9 +58,9 @@ class ModelRunner:
         qcfg = get_quant_config()
         if not qcfg.enabled:
             raise RuntimeError("NVFP4-only runtime: quantization config is not NVFP4.")
-        if qcfg.kv_cache_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
-            raise RuntimeError("NVFP4-only runtime: KV cache must be FP8.")
-        if not qcfg.fp8_decode_kernel_enabled:
+        if qcfg.kv_cache_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2, torch.float16, torch.bfloat16):
+            raise RuntimeError("NVFP4-only runtime: KV cache must be FP8 or fp16/bf16.")
+        if qcfg.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and not qcfg.fp8_decode_kernel_enabled:
             raise RuntimeError("NVFP4-only runtime: fp8_decode_kernel_enabled must be True.")
         hf_config.moe_offload_experts = bool(getattr(config, "moe_offload_experts", False))
         hf_config.moe_gpu_expert_capacity = int(getattr(config, "moe_gpu_expert_capacity", 0))
@@ -218,21 +218,28 @@ class ModelRunner:
         self.delta_modules = delta_modules
         self.graph_delta_slots = torch.zeros(num_delta_slots, dtype=torch.int64, device=self.kv_cache.device)
         layer_id = 0
+        import os as _os
+        self.kv_shadow_enabled = bool(_os.environ.get("ADALLM_KV_SHADOW"))
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 module.layer_id = layer_id
+                if self.kv_shadow_enabled and kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    module.k_shadow = torch.zeros_like(module.k_cache, dtype=torch.float16)
+                    module.v_shadow = torch.zeros_like(module.v_cache, dtype=torch.float16)
                 layer_id += 1
 
     def fp8_decode_selftest(self):
         if self.enforce_eager:
             # Still compile once to fail fast on kernel issues.
             pass
-        from adallm.ops.attention import fp8_kv_decode_group_kernel
         qcfg = get_quant_config()
+        if qcfg.kv_cache_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+            return  # fp16/bf16 KV cache: decode uses flash paged path, nothing to selftest
         if not qcfg.fp8_decode_kernel_enabled:
             raise RuntimeError("FP8 decode kernel is disabled; this runtime requires it.")
+        from adallm.ops.attention import fp8_kv_decode_group_kernel
         # Use the first attention module's cache to compile the kernel.
         attn = next(m for m in self.model.modules() if hasattr(m, "k_cache") and hasattr(m, "v_cache"))
         k_cache = attn.k_cache
@@ -312,23 +319,6 @@ class ModelRunner:
         block_tables = None
         delta_slots = []
         for seq in seqs:
-            if seq.cur_chunk == -1 and len(seq) > seq.num_prompt_tokens:
-                # Round5-B decode rider piggybacked into a prefill step:
-                # process exactly the last token against full context —
-                # mathematically identical to the decode path (same slot,
-                # same position, same delta state semantics).
-                input_ids.append(seq.last_token)
-                positions.append(len(seq) - 1)
-                cu_seqlens_q.append(cu_seqlens_q[-1] + 1)
-                cu_seqlens_k.append(cu_seqlens_k[-1] + len(seq))
-                max_seqlen_q = max(1, max_seqlen_q)
-                max_seqlen_k = max(len(seq), max_seqlen_k)
-                delta_slots.append(seq.delta_slot)
-                if seq.block_table:
-                    slot_mapping.append(
-                        seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
-                    )
-                continue
             start = seq.num_cached_tokens + seq.num_prefilled_tokens
             chunk = seq.cur_chunk if seq.cur_chunk > 0 else len(seq) - start
             input_ids.extend(seq[start : start + chunk])
@@ -339,12 +329,7 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if (
-                seq.delta_slot > 0
-                and seq.num_prefilled_tokens == 0
-                and seq.num_cached_tokens == 0
-                and len(seq) == seq.num_prompt_tokens
-            ):
+            if seq.delta_slot > 0 and seq.num_prefilled_tokens == 0 and seq.num_cached_tokens == 0:
                 self._reset_delta_slot(seq.delta_slot)    # fresh seq: zero recycled state
             delta_slots.append(seq.delta_slot)
             if not seq.block_table:    # warmup
@@ -365,11 +350,14 @@ class ModelRunner:
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=_PIN).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=_PIN).cuda(non_blocking=True)
+        cu_q_host, slots_host = list(cu_seqlens_q), list(delta_slots)
+        q_len_host = [cu_q_host[i + 1] - cu_q_host[i] for i in range(len(slots_host))]
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=_PIN).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=_PIN).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=_PIN).cuda(non_blocking=True)
         delta_slots = torch.tensor(delta_slots, dtype=torch.int64, pin_memory=_PIN).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, delta_slots)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, delta_slots,
+                    cu_q_list=cu_q_host, slots_list=slots_host, q_len_list=q_len_host)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -403,6 +391,76 @@ class ModelRunner:
             temperatures.append(seq.temperature)
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=_PIN).cuda(non_blocking=True)
         return temperatures
+
+    @torch.inference_mode()
+    def capture_verify_graph(self, span_rows: int = 4):
+        """Round8-A/C (lever 1): CUDA graph for a FIXED-shape span-row
+        prefill-continuation forward (MTP verify k+1 / replay a+1) for a
+        single sequence. Multiple spans are kept in self.verify_graphs
+        (span -> (graph, gv)); the legacy single-graph attributes
+        (verify_graph/verify_graph_vars) point at the most recent capture
+        for backward compat. Static buffers per span; slot_mapping filled
+        with -1 during capture warmup (store kernel skips negatives — no
+        KV corruption); delta writes during warmup land in NULL slot 0,
+        re-zeroed after capture."""
+        if self.enforce_eager:
+            return False
+        if span_rows in self.verify_graphs:
+            g, gv = self.verify_graphs[span_rows]
+            self.verify_graph, self.verify_graph_vars = g, gv
+            return True
+        dev = "cuda"
+        bs = span_rows
+        max_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size
+        gv = {
+            "input_ids": torch.zeros(bs, dtype=torch.int64, device=dev),
+            "positions": torch.arange(bs, dtype=torch.int64, device=dev),
+            "slot_mapping": torch.zeros(bs, dtype=torch.int32, device=dev),
+            "cu_q": torch.tensor([0, bs], dtype=torch.int32, device=dev),
+            "cu_k": torch.tensor([0, self.config.max_model_len], dtype=torch.int32, device=dev),
+            "block_tables": torch.zeros(1, max_blocks, dtype=torch.int32, device=dev),
+            "n_blocks_row": torch.zeros(1, dtype=torch.int32, device=dev),
+            "delta_slot": torch.zeros(1, dtype=torch.int64, device=dev),
+            "hidden": torch.zeros(bs, self.config.hf_config.hidden_size, device=dev),
+        }
+        # cu_seqlens_k must reflect actual k length: block-table gather path
+        # (prefix cache) uses cu_k[1:] - cu_k[:-1] as block counts. Use a
+        # dedicated static "k_len" we update per replay via n_blocks_row.
+        # For the no-prefix-cache path flash reads cu_k directly: we cap it
+        # with a large but valid value (max_model_len) — kernel treats it as
+        # max hint only when block_tables present.
+        try:
+            # warmup (slot_mapping=-1: store_kvcache skips negatives, so the
+            # warmup run does NOT corrupt KV pool block 0)
+            gv["slot_mapping"].fill_(-1)
+            set_context(True,
+                        cu_seqlens_q=gv["cu_q"], cu_seqlens_k=gv["cu_k"],
+                        max_seqlen_q=bs, max_seqlen_k=self.config.max_model_len,
+                        slot_mapping=gv["slot_mapping"], context_lens=None,
+                        block_tables=gv["block_tables"],
+                        delta_slots=gv["delta_slot"],
+                        cu_q_list=[0, bs], slots_list=[0], q_len_list=[bs])
+            gv["hidden"] = self.model(gv["input_ids"], gv["positions"])
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, self.graph_pool):
+                gv["hidden"] = self.model(gv["input_ids"], gv["positions"])
+            self.verify_graph = graph
+            self.verify_graph_vars = gv
+            self.verify_graphs[span_rows] = (graph, gv)
+            # capture warmup wrote window/state rows into the reserved NULL
+            # delta slot 0 (prefill branch index_copy_ doesn't skip 0) —
+            # restore the always-zero invariant.
+            for m in self.model.modules():
+                st = getattr(m, "mamba_state", None)
+                if st is not None and hasattr(m, "conv_state"):
+                    st[0].zero_()
+                    m.conv_state[0].zero_()
+            reset_context()
+            return True
+        except Exception as e:
+            print(f"[verify-graph] capture FAILED ({e!r}); MTP stays eager", flush=True)
+            reset_context()
+            return False
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
@@ -470,15 +528,12 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        # Round5-B: always capture a graph at exactly max_bs so decode batches
-        # of bs 9..max_bs (e.g. max_num_seqs=10) don't silently fall back to
-        # eager (~2x slower decode; measured 85 vs 182 tok/s agg at bs 10/8).
-        bs_list = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-        if max_bs not in bs_list:
-            bs_list.append(max_bs)
-        self.graph_bs = [bs for bs in bs_list if bs <= max_bs]
+        self.graph_bs = [bs for bs in ([1, 2, 4, 8] + list(range(16, max_bs + 1, 16))) if bs <= max_bs]
         self.graphs = {}
         self.graph_pool = None
+        self.verify_graph = None
+        self.verify_graph_vars = None
+        self.verify_graphs = {}          # Round8-C: span -> (graph, gv)
         # Round4-B: static buffers for in-graph lm_head + sampler
         sample_ids = torch.zeros(max_bs, dtype=torch.int64)
         temperatures = torch.ones(max_bs, dtype=torch.float32)

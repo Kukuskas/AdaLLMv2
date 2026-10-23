@@ -37,24 +37,6 @@ _TINY_N_MAX = int(os.getenv("ADALLM_TINYGEMM_N_MAX", "1024"))
 # F.linear calls (weights concatenated). Default on; disable to isolate.
 _TINYGEMM_FUSE = os.getenv("ADALLM_TINYGEMM_FUSE", "1").strip().lower() not in ("0", "false", "off")
 
-# Round4-B measured per-shape dispatch table (default OFF). Comma-separated
-# "NxK" list of NVFP4 GEMM shapes to route to cuBLAS on a dequantized fp16
-# weight instead of Marlin, regardless of N. Measured per-shape at decode M
-# (see probes/round4-b/bench_dispatch.py + findings round4-b-dispatch):
-# env-gated static table; modules listed here are dequantized BEFORE the
-# Marlin repack so the packed copy is the one freed.
-_DEQ_SHAPES_RAW = os.getenv("ADALLM_DEQ_SHAPES", "").strip()
-DEQ_SHAPES = set()
-for _tok in _DEQ_SHAPES_RAW.split(","):
-    _tok = _tok.strip().lower()
-    if not _tok:
-        continue
-    try:
-        _n, _k = _tok.split("x")
-        DEQ_SHAPES.add((int(_n), int(_k)))
-    except ValueError:
-        print(f"[deq-shapes] ignoring malformed token {_tok!r}")
-
 try:
     from vllm.model_executor.kernels.linear.nvfp4.marlin import (
         apply_fp4_marlin_linear,
@@ -144,12 +126,12 @@ def repack_model(model: nn.Module) -> int:
     """Repack every nvfp4 LinearBase in the model. Returns count."""
     if marlin_available():
         count = _repack_model_impl(model)
-    elif TINYGEMM_ENABLED or DEQ_SHAPES:
-        # no Marlin: nothing to repack, only dequant paths run
-        count = 0
+    elif TINYGEMM_ENABLED:
+        # tiny-GEMM path works without vLLM/Marlin imports too
+        count = _repack_model_impl(model)
     else:
         return 0
-    if TINYGEMM_ENABLED or DEQ_SHAPES:
+    if TINYGEMM_ENABLED:
         _dequant_tiny_layers(model)
     return count
 
@@ -203,7 +185,7 @@ def _dequant_tiny_layers(model: nn.Module) -> int:
         w = getattr(module, "weight", None)
         if w is None or w.dtype != torch.uint8 or w.ndim != 2 or w.numel() == 0:
             continue
-        if w.shape[0] > _TINY_N_MAX and (w.shape[0], w.shape[1] * 2) not in DEQ_SHAPES:
+        if w.shape[0] > _TINY_N_MAX:
             continue
         if getattr(module, "tinyygemm_ready", False):
             continue
@@ -274,8 +256,6 @@ def _repack_model_impl(model: nn.Module) -> int:
         w = getattr(module, "weight", None)
         if w is None or w.dtype != torch.uint8 or w.ndim != 2:
             continue
-        if (w.shape[0], w.shape[1] * 2) in DEQ_SHAPES:
-            continue  # Round4-B dispatch table: routed to cuBLAS dequant instead
         if w.shape[0] < _MARLIN_N_MIN:
             continue  # tiny-N layers keep Triton (marlin slower there)
         try:

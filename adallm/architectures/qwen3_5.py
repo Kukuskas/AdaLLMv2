@@ -23,7 +23,7 @@ from adallm.architectures.qwen3 import (
 from adallm.architectures.qwen3 import Qwen3MLP
 from adallm.ops.attention import Attention
 from adallm.ops.layernorm import RMSNorm, GemmaRMSNorm
-from adallm.ops.linear import RowParallelLinear, ReplicatedLinear, pair_linear
+from adallm.ops.linear import RowParallelLinear, ReplicatedLinear, ColumnParallelLinear, pair_linear
 from adallm.infra.context import get_context
 
 try:
@@ -34,27 +34,6 @@ try:
 except Exception:
     fused_recurrent_gated_delta_rule = None
     fused_recurrent_gated_delta_rule_packed_decode = None
-
-try:
-    from vllm.model_executor.layers.fla.ops import chunk_gated_delta_rule as _chunk_gdn
-except Exception:
-    _chunk_gdn = None
-
-# Round4-B prefill speedup (default OFF): block-parallel chunk kernel for the
-# gated-delta-rule prefill instead of the sequential fused_recurrent kernel.
-# Real-input microbench (T=8192, layer 0, 16K real prompt): 10.61 -> 2.65 ms
-# per layer call (4.0x); out relerr 1.6e-4 vs recurrent. The recurrent kernel
-# is serial over T; real g (decay gate) medians ~-1.7e-3, i.e. near-zero
-# decay, which makes the serial chain long. The chunk kernel processes 64-
-# token blocks with matmuls instead.
-import os as _os
-_DELTA_CHUNK_ENV = _os.getenv("ADALLM_DELTA_CHUNK", "0").strip().lower()
-DELTA_CHUNK_ENABLED = (_DELTA_CHUNK_ENV not in ("0", "false", "off", "")) and _chunk_gdn is not None
-# below this chunk length the fixed overhead of the chunk kernel dominates
-_DELTA_CHUNK_MIN_T = int(_os.getenv("ADALLM_DELTA_CHUNK_MIN_T", "256"))
-
-# Round4-B MLP cat bypass (default OFF): see Qwen3_5MLP.forward.
-_MLP_NO_CAT = _os.getenv("ADALLM_MLP_NO_CAT", "0").strip().lower() not in ("0", "false", "off", "")
 
 
 class Qwen3_5RotaryEmbedding(nn.Module):
@@ -97,11 +76,28 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.num_k_heads = config.linear_num_key_heads
         self.head_k_dim = config.linear_key_head_dim
         self.head_v_dim = config.linear_value_head_dim
+        self.layer_idx = layer_idx
+        self.layer_norm_epsilon = config.rms_norm_eps
+
+        # Round8-E (TP=2): head-shard the delta-net across TP ranks. Value and
+        # key heads divide evenly (48 v / 16 k -> 24 / 8 at tp=2), so every
+        # per-head quantity (in_proj_qkv/z/b/a outputs, dt_bias, A_log, conv
+        # channels, recurrent/conv state pools) shards by contiguous head
+        # ranges. The vLLM Triton kernels are shape-dynamic (HV/K/V inferred
+        # from the state-pool tensor), so no kernel changes are needed.
+        # At tp==1 every attribute and module below is EXACTLY as before —
+        # bitwise-identical to the tuned single-GPU stack.
+        import torch.distributed as _dist
+        _tp = _dist.get_world_size() if _dist.is_initialized() else 1
+        self.tp_size = _tp
+        self.tp_rank = _dist.get_rank() if _tp > 1 else 0
+        if _tp > 1:
+            assert self.num_v_heads % _tp == 0 and self.num_k_heads % _tp == 0
+            self.num_v_heads = self.num_v_heads // _tp
+            self.num_k_heads = self.num_k_heads // _tp
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.conv_kernel_size = config.linear_conv_kernel_dim
-        self.layer_idx = layer_idx
-        self.layer_norm_epsilon = config.rms_norm_eps
 
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.conv1d = nn.Conv1d(
@@ -112,17 +108,53 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             groups=self.conv_dim,
             padding=self.conv_kernel_size - 1,
         )
+        # conv1d channels follow the sharded head ranges. The checkpoint's
+        # [conv_dim, 1, k] dim 0 is the SAME [Q(Kf) | K(Kf) | V(Vf)] concat
+        # as in_proj_qkv, so it needs the SECTION-wise head slicer — a plain
+        # contiguous dim-0 narrow would grab all of Q, all of K and part of V.
+        self.conv1d.weight.weight_loader = self._qkv_head_shard_loader
 
         # Split projections matching checkpoint names exactly.
-        self.in_proj_qkv = ReplicatedLinear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
-        self.in_proj_z = ReplicatedLinear(self.hidden_size, self.value_dim, bias=False)
-        self.in_proj_b = ReplicatedLinear(self.hidden_size, self.num_v_heads, bias=False)
-        self.in_proj_a = ReplicatedLinear(self.hidden_size, self.num_v_heads, bias=False)
+        if _tp > 1:
+            # ColumnParallel shards the OUTPUT dim by contiguous head ranges —
+            # exactly the per-rank head slice (in_proj_qkv output is the
+            # contiguous concat [Q(key_dim) | K(key_dim) | V(value_dim)], whose
+            # head groups divide evenly, so dim-0 narrowing respects head
+            # head boundaries). out_proj becomes RowParallel again: pass the
+            # FULL value_dim (RowParallelLinear divides input by tp itself);
+            # each rank's K slice = its contiguous v-head range, matching the
+            # head-sharded activation; partials all-reduce to the full result.
+            _full_k = config.linear_num_key_heads * self.head_k_dim
+            _full_v = config.linear_num_value_heads * self.head_v_dim
+            self.in_proj_qkv = ColumnParallelLinear(self.hidden_size, _full_k * 2 + _full_v, bias=False)
+            # ColumnParallelLinear's default loader narrows dim 0
+            # CONTIGUOUSLY, but in_proj_qkv's full output is the concat
+            # [Q(Kf) | K(Kf) | V(Vf)] — the rank's head range lives in THREE
+            # separate row sections. Replace the loader with a section-wise
+            # head slicer (for both the packed weight and its per-group
+            # scales; both are dim-0 sectioned identically).
+            self.in_proj_qkv.weight_loader = self._qkv_head_shard_loader
+            self.in_proj_qkv.weight.weight_loader = self._qkv_head_shard_loader
+            if hasattr(self.in_proj_qkv, "weight_scale"):
+                self.in_proj_qkv.weight_scale.weight_loader = self._qkv_head_shard_loader
+            self.in_proj_z = ColumnParallelLinear(self.hidden_size, _full_v, bias=False)
+            self.in_proj_b = ColumnParallelLinear(self.hidden_size, config.linear_num_value_heads, bias=False)
+            self.in_proj_a = ColumnParallelLinear(self.hidden_size, config.linear_num_value_heads, bias=False)
+            self.out_proj = RowParallelLinear(_full_v, self.hidden_size, bias=False)
+        else:
+            self.in_proj_qkv = ReplicatedLinear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
+            self.in_proj_z = ReplicatedLinear(self.hidden_size, self.value_dim, bias=False)
+            self.in_proj_b = ReplicatedLinear(self.hidden_size, self.num_v_heads, bias=False)
+            self.in_proj_a = ReplicatedLinear(self.hidden_size, self.num_v_heads, bias=False)
+            self.out_proj = ReplicatedLinear(self.value_dim, self.hidden_size, bias=False)
 
+        # dt_bias/A_log are per-v-head [num_v_heads]: each rank keeps its own
+        # head chunk of the checkpoint tensor.
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
         self.A_log = nn.Parameter(torch.zeros(self.num_v_heads))
+        self.dt_bias.weight_loader = self._sharded_dim0_loader
+        self.A_log.weight_loader = self._sharded_dim0_loader
         self.norm = Qwen3NextRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
-        self.out_proj = RowParallelLinear(self.value_dim, self.hidden_size, bias=False)
 
         # CUDA-graph-safe recurrent state pool (vLLM mamba-style):
         #   mamba_state: [num_slots, HV, V, K]; conv_state: [num_slots, conv_dim, kernel-1]
@@ -146,6 +178,37 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             device=device, dtype=dtype,
         )
 
+    def _sharded_dim0_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, *_):
+        """Round8-E: load the rank's contiguous dim-0 head chunk at tp>1;
+        identity copy at tp==1 (bitwise-identical single-GPU behavior)."""
+        if self.tp_size > 1:
+            shard = param.data.size(0)
+            loaded_weight = loaded_weight.narrow(0, self.tp_rank * shard, shard)
+        param.data.copy_(loaded_weight)
+
+    def _qkv_head_shard_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, *_):
+        """Round8-E: section-wise head shard for in_proj_qkv. The checkpoint
+        tensor's dim 0 is [Q(Kf) | K(Kf) | V(Vf)]; each rank takes its head
+        range WITHIN EACH SECTION and re-concats, yielding the local
+        [Q(Kf/tp) | K(Kf/tp) | V(Vf/tp)] rows. Works identically for the
+        packed weight [N, H/2] and per-group scales [N, H/gs]."""
+        if self.tp_size == 1:
+            param.data.copy_(loaded_weight)
+            return
+        full_k = self.num_k_heads * self.tp_size * self.head_k_dim
+        full_v = self.num_v_heads * self.tp_size * self.head_v_dim
+        r, tp = self.tp_rank, self.tp_size
+        sections = [
+            loaded_weight.narrow(0, 0, full_k),                      # Q
+            loaded_weight.narrow(0, full_k, full_k),                 # K
+            loaded_weight.narrow(0, 2 * full_k, full_v),             # V
+        ]
+        sharded = torch.cat(
+            [s.narrow(0, r * (s.size(0) // tp), s.size(0) // tp) for s in sections],
+            dim=0,
+        )
+        param.data.copy_(sharded)
+
     def _split_qkv(self, mixed_qkv: torch.Tensor):
         # HF qwen3_5 layout is contiguous: [Q(key_dim) | K(key_dim) | V(value_dim)]
         # (unlike Qwen3-Next's fused per-group-interleaved qkvz ordering).
@@ -167,19 +230,34 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             cu = context.cu_seqlens_q
             n_seqs = cu.shape[0] - 1
             slots = context.delta_slots              # [n_seqs] int64
+            # Round8-C: host mirrors (prepare_prefill builds these from Python
+            # lists) — avoids per-layer .item()/int() device syncs AND makes
+            # this branch graph-capture-safe. Fall back to device reads only
+            # when a caller set context manually without mirrors.
+            cu_host = context.cu_q_list
+            slots_host = context.slots_list
+            if cu_host is not None and slots_host is not None and len(cu_host) == n_seqs + 1:
+                bounds = [(cu_host[i], cu_host[i + 1], slots_host[i]) for i in range(n_seqs)]
+                lens = [s1 - s0 for s0, s1, _ in bounds]
+            else:
+                bounds = [(int(cu[i]), int(cu[i + 1]), int(slots[i])) for i in range(n_seqs)]
+                lens = [s1 - s0 for s0, s1, _ in bounds]
             conv_out = torch.empty_like(mixed_qkv)
             weight = self.conv1d.weight.squeeze(1)   # [conv_dim, kernel]
             kml1 = self.conv_kernel_size - 1
-            for i in range(n_seqs):
-                s0, s1 = int(cu[i]), int(cu[i + 1])
-                slot = int(slots[i])
+            # Round8-C: device-indexed state addressing (slots TENSOR, not
+            # host ints) — required for CUDA-graph capture (host ints would
+            # bake the slot id into the graph) and removes sync in eager.
+            prev_states = self.conv_state.index_select(0, slots)  # [n, conv_dim, k-1]
+            new_states = torch.empty_like(prev_states)
+            for i, (s0, s1, _slot) in enumerate(bounds):
                 x = mixed_qkv[s0:s1].transpose(0, 1)                 # [conv_dim, T]
-                prev = self.conv_state[slot]                         # zeros for fresh seqs
-                window = torch.cat([prev, x], dim=-1)                # [conv_dim, T+k-1]
+                window = torch.cat([prev_states[i], x], dim=-1)      # [conv_dim, T+k-1]
                 out = F.conv1d(window, self.conv1d.weight, groups=self.conv_dim, padding=0)
                 conv_out[s0:s1] = F.silu(out).transpose(0, 1)
                 # carry last k-1 columns (covers x, possibly zeros) into pool
-                self.conv_state[slot] = window[:, -kml1:].detach()
+                new_states[i] = window[:, -kml1:].detach()
+            self.conv_state.index_copy_(0, slots, new_states)
 
             total = conv_out.shape[0]
             q = conv_out[:, : self.key_dim].view(1, total, self.num_k_heads, self.head_k_dim)
@@ -190,43 +268,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
             # Kernel reads ssm_state_indices[i_n, i_t] per token → needs a 2-D
             # [N, T] tensor (1-D would read OOB at i_t > 0 → illegal access).
-            lens = [int(cu[i + 1] - cu[i]) for i in range(n_seqs)]
+            # Round8-C: built from the slots TENSOR (device values) so CUDA
+            # graph capture records tensor ops, not baked host ints. Single
+            # expand covers all rows; padded rows beyond lens[i] are ignored
+            # by the kernel via cu_seqlens bounds.
             max_len = max(lens) if lens else 1
-            idx2d = slots.new_zeros(n_seqs, max(max_len, 1))
-            for i in range(n_seqs):
-                idx2d[i, : lens[i]] = slots[i]
+            idx2d = slots.view(-1, 1).expand(n_seqs, max(max_len, 1)).contiguous()
 
-            use_chunk = (
-                DELTA_CHUNK_ENABLED
-                and slots is not None
-                and n_seqs == len(slots)
-                and max_len >= _DELTA_CHUNK_MIN_T
+            core_attn_out, _ = fused_recurrent_gated_delta_rule(
+                q=q.contiguous(), k=k.contiguous(), v=v.contiguous(),
+                g=g.contiguous(), beta=beta.contiguous(),
+                initial_state=self.mamba_state,
+                inplace_final_state=True,
+                cu_seqlens=cu,
+                ssm_state_indices=idx2d,
+                use_qk_l2norm_in_kernel=True,
             )
-            if use_chunk:
-                # Round4-B: block-parallel chunk kernel (4x faster per layer at
-                # T=8K; see module header). State gather/scatter: the chunk API
-                # takes initial_state[N,H,V,K] + returns final states, while the
-                # pool is shared with the decode path (slot-indexed).
-                init = self.mamba_state.index_select(0, slots)
-                core_attn_out, ht = _chunk_gdn(
-                    q=q.contiguous(), k=k.contiguous(), v=v.contiguous(),
-                    g=g.contiguous(), beta=beta.contiguous(),
-                    initial_state=init,
-                    output_final_state=True,
-                    cu_seqlens=cu,
-                    use_qk_l2norm_in_kernel=True,
-                )
-                self.mamba_state.index_copy_(0, slots, ht.to(self.mamba_state.dtype))
-            else:
-                core_attn_out, _ = fused_recurrent_gated_delta_rule(
-                    q=q.contiguous(), k=k.contiguous(), v=v.contiguous(),
-                    g=g.contiguous(), beta=beta.contiguous(),
-                    initial_state=self.mamba_state,
-                    inplace_final_state=True,
-                    cu_seqlens=cu,
-                    ssm_state_indices=idx2d,
-                    use_qk_l2norm_in_kernel=True,
-                )
             core_attn_out = core_attn_out.squeeze(0)                 # [T, HV*V]
         else:
             # ---- decode: batch of single tokens, state pool addressing ----
@@ -282,9 +339,25 @@ class Qwen3_5Attention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.scaling = self.head_dim ** -0.5
 
-        self.q_proj = ReplicatedLinear(config.hidden_size, config.num_attention_heads * self.head_dim * 2, bias=False)
-        self.k_proj = ReplicatedLinear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = ReplicatedLinear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
+        # Round8-D (TP=2): attention projections must be CONSISTENT under TP.
+        # q/k/v ColumnParallel-shard the heads (24→12, 4→2 per rank — q emits
+        # 2x head_dim per head for the sigmoid gate, still shardable) so the
+        # activation entering o_proj is num_heads/tp * head_dim, matching
+        # o_proj's RowParallel K. Single-GPU (tp==1) keeps the original
+        # replicated q/k/v — bitwise-identical to the tuned prod stack.
+        import torch.distributed as _dist
+        _tp = _dist.get_world_size() if _dist.is_initialized() else 1
+        if _tp > 1:
+            from adallm.ops.linear import QKVParallelLinear
+            self.q_proj = ColumnParallelLinear(config.hidden_size, config.num_attention_heads * self.head_dim * 2, bias=False)
+            self.k_proj = ColumnParallelLinear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
+            self.v_proj = ColumnParallelLinear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
+            self.num_heads = config.num_attention_heads // _tp
+            self.num_kv_heads = config.num_key_value_heads // _tp
+        else:
+            self.q_proj = ReplicatedLinear(config.hidden_size, config.num_attention_heads * self.head_dim * 2, bias=False)
+            self.k_proj = ReplicatedLinear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
+            self.v_proj = ReplicatedLinear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = RowParallelLinear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
         # qwen3_5 norms are zero-centered: y = x_hat * (1 + w)
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -330,21 +403,26 @@ class Qwen3_5MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        from adallm.ops.linear import ReplicatedLinear, RowParallelLinear
+        from adallm.ops.linear import ReplicatedLinear, RowParallelLinear, ColumnParallelLinear
+        import torch.distributed as _dist
         from adallm.ops.activation import SiluAndMul
-        self.gate_proj = ReplicatedLinear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = ReplicatedLinear(config.hidden_size, config.intermediate_size, bias=False)
+        # Round8-D (TP=2): at world_size>1, gate/up MUST be ColumnParallel so
+        # the activation entering down_proj is intermediate_size/world_size,
+        # matching down_proj's sharded K (QUASAR's per-projection global
+        # scales still work: sharding is along the output dim, scales slice
+        # with it). Single-GPU path (world_size==1) keeps ReplicatedLinear —
+        # bitwise-identical to the tuned single-GPU stack.
+        _tp = _dist.get_world_size() if _dist.is_initialized() else 1
+        if _tp > 1:
+            self.gate_proj = ColumnParallelLinear(config.hidden_size, config.intermediate_size, bias=False)
+            self.up_proj = ColumnParallelLinear(config.hidden_size, config.intermediate_size, bias=False)
+        else:
+            self.gate_proj = ReplicatedLinear(config.hidden_size, config.intermediate_size, bias=False)
+            self.up_proj = ReplicatedLinear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = RowParallelLinear(config.intermediate_size, config.hidden_size, bias=False)
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        # Round4-B (ADALLM_MLP_NO_CAT=1, default off): gate/up arrive as two
-        # SEPARATE projections here; cat() + SiluAndMul's chunk() is a wasted
-        # 312 MiB round-trip per layer at 8K-token prefill chunks (~154 ms of
-        # pure memory traffic per chunk). silu(gate)*up is the identical math
-        # (byte-identical outputs) with no intermediate cat tensor.
-        if _MLP_NO_CAT:
-            return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
         gate = self.gate_proj(x)
         up = self.up_proj(x)
         return self.down_proj(self.act_fn(torch.cat([gate, up], dim=-1)))
