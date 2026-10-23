@@ -425,19 +425,30 @@ class ModelRunner:
         # with a large but valid value (max_model_len) — kernel treats it as
         # max hint only when block_tables present.
         try:
-            # warmup
+            # warmup (slot_mapping=-1: store_kvcache skips negatives, so the
+            # warmup run does NOT corrupt KV pool block 0)
+            gv["slot_mapping"].fill_(-1)
             set_context(True,
                         cu_seqlens_q=gv["cu_q"], cu_seqlens_k=gv["cu_k"],
                         max_seqlen_q=bs, max_seqlen_k=self.config.max_model_len,
                         slot_mapping=gv["slot_mapping"], context_lens=None,
                         block_tables=gv["block_tables"],
-                        delta_slots=gv["delta_slot"])
+                        delta_slots=gv["delta_slot"],
+                        cu_q_list=[0, bs], slots_list=[0], q_len_list=[bs])
             gv["hidden"] = self.model(gv["input_ids"], gv["positions"])
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, self.graph_pool):
                 gv["hidden"] = self.model(gv["input_ids"], gv["positions"])
             self.verify_graph = graph
             self.verify_graph_vars = gv
+            # capture warmup wrote window/state rows into the reserved NULL
+            # delta slot 0 (prefill branch index_copy_ doesn't skip 0) —
+            # restore the always-zero invariant.
+            for m in self.model.modules():
+                st = getattr(m, "mamba_state", None)
+                if st is not None and hasattr(m, "conv_state"):
+                    st[0].zero_()
+                    m.conv_state[0].zero_()
             reset_context()
             return True
         except Exception as e:

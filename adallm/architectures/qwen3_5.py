@@ -161,14 +161,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             conv_out = torch.empty_like(mixed_qkv)
             weight = self.conv1d.weight.squeeze(1)   # [conv_dim, kernel]
             kml1 = self.conv_kernel_size - 1
-            for s0, s1, slot in bounds:
+            # Round8-C: device-indexed state addressing (slots TENSOR, not
+            # host ints) — required for CUDA-graph capture (host ints would
+            # bake the slot id into the graph) and removes sync in eager.
+            prev_states = self.conv_state.index_select(0, slots)  # [n, conv_dim, k-1]
+            new_states = torch.empty_like(prev_states)
+            for i, (s0, s1, _slot) in enumerate(bounds):
                 x = mixed_qkv[s0:s1].transpose(0, 1)                 # [conv_dim, T]
-                prev = self.conv_state[slot]                         # zeros for fresh seqs
-                window = torch.cat([prev, x], dim=-1)                # [conv_dim, T+k-1]
+                window = torch.cat([prev_states[i], x], dim=-1)      # [conv_dim, T+k-1]
                 out = F.conv1d(window, self.conv1d.weight, groups=self.conv_dim, padding=0)
                 conv_out[s0:s1] = F.silu(out).transpose(0, 1)
                 # carry last k-1 columns (covers x, possibly zeros) into pool
-                self.conv_state[slot] = window[:, -kml1:].detach()
+                new_states[i] = window[:, -kml1:].detach()
+            self.conv_state.index_copy_(0, slots, new_states)
 
             total = conv_out.shape[0]
             q = conv_out[:, : self.key_dim].view(1, total, self.num_k_heads, self.head_k_dim)
@@ -179,10 +184,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
             # Kernel reads ssm_state_indices[i_n, i_t] per token → needs a 2-D
             # [N, T] tensor (1-D would read OOB at i_t > 0 → illegal access).
+            # Round8-C: built from the slots TENSOR (device values) so CUDA
+            # graph capture records tensor ops, not baked host ints. Single
+            # expand covers all rows; padded rows beyond lens[i] are ignored
+            # by the kernel via cu_seqlens bounds.
             max_len = max(lens) if lens else 1
-            idx2d = slots.new_zeros(n_seqs, max(max_len, 1))
-            for i, (s0, s1, slot) in enumerate(bounds):
-                idx2d[i, : s1 - s0] = slot
+            idx2d = slots.view(-1, 1).expand(n_seqs, max(max_len, 1)).contiguous()
 
             core_attn_out, _ = fused_recurrent_gated_delta_rule(
                 q=q.contiguous(), k=k.contiguous(), v=v.contiguous(),

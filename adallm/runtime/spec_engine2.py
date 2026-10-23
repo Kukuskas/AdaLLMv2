@@ -27,6 +27,7 @@ import time
 import torch
 
 from adallm.architectures.mtp_draft import MTPDraft, load_mtp
+from adallm.infra.context import get_context
 from adallm.runtime.sequence import SequenceStatus as _SEQ_ST
 _SEQ_FINISHED = _SEQ_ST.FINISHED
 
@@ -275,6 +276,46 @@ class SpecEngine2:
                 del bm.hash_to_block_id[last.hash]
             last.reset()
 
+    # ---------- L1b: graphed verify forward ----------
+
+    def _ensure_verify_graph(self, span: int):
+        """Capture (once) the fixed-shape span-row verify forward. Requires
+        enforce_eager=False engine and ADALLM_PAGED_VERIFY attention (the
+        paged splitk path is device-indexed, capture-safe; the gather path
+        has .item() syncs and cannot be captured)."""
+        if getattr(self.mr, "verify_graph", None) is not None:
+            return self.mr.verify_graph_vars
+        try:
+            ok = self.mr.capture_verify_graph(span_rows=span)
+        except Exception as e:
+            _dbg(f"verify-graph capture failed: {e!r}")
+            ok = False
+        if not ok:
+            return None
+        return self.mr.verify_graph_vars
+
+    def _verify_forward(self, input_ids: torch.Tensor, positions: torch.Tensor):
+        """4-row verify forward: graph replay if available, else eager.
+        Returns hidden [span, H]."""
+        gv = getattr(self.mr, "verify_graph_vars", None)
+        graph = getattr(self.mr, "verify_graph", None)
+        if gv is not None and graph is not None and input_ids.shape[0] == gv["input_ids"].shape[0]:
+            ctx = get_context()
+            bs = input_ids.shape[0]
+            gv["input_ids"].copy_(input_ids)
+            gv["positions"].copy_(positions)
+            gv["slot_mapping"][:] = ctx.slot_mapping
+            gv["delta_slot"][:] = ctx.delta_slots
+            bt = ctx.block_tables
+            gv["block_tables"].zero_()
+            gv["block_tables"][0, : bt.shape[1]].copy_(bt[0])
+            # cu_k[1] = start + n_q: device copy from the live context
+            gv["cu_k"][1] = ctx.cu_seqlens_k[1]
+            graph.replay()
+            return gv["hidden"]
+        hidden = self.mr.model(input_ids, positions)
+        return hidden
+
     # ---------- spec step ----------
 
     def _spec(self, seq):
@@ -336,7 +377,11 @@ class SpecEngine2:
         input_ids, positions = mr.prepare_prefill(seqs_now)
         _t0 = time.perf_counter()
         with torch.inference_mode():
-            hidden = mr.model(input_ids, positions)          # [k+1, H]
+            # Round8-C L1b: graphed verify (fixed span k+1) if enabled+captured
+            if os.getenv("ADALLM_MTP_GRAPH", "0") == "1" and \
+                    getattr(mr, "verify_graph", None) is None:
+                self._ensure_verify_graph(k + 1)
+            hidden = self._verify_forward(input_ids, positions)     # [k+1, H]
             logits = hidden.to(self.lm_head_w.dtype) @ self.lm_head_w.t()
         torch.cuda.synchronize(); self.stats["t_verify"] += time.perf_counter() - _t0
         t_greedy = logits.argmax(dim=-1).tolist()            # row i predicts span[i+1]
