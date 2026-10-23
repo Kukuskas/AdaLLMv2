@@ -118,19 +118,22 @@ class AdallmMarlinNvFp4LinearKernel:
     ) -> torch.Tensor:
         from . import marlin_vendored
 
-        if not getattr(layer, "marlin_ready", False):
-            import os as _os
-            if _os.getenv("ADALLM_PLUGIN_DEBUG"):
-                print(f"[adallm-plugin] FALLBACK path, weight {tuple(layer.weight.shape)}", flush=True)
-            return self._fallback_matmul(layer, x, bias)
-        import os as _os
-        if _os.getenv("ADALLM_PLUGIN_DEBUG") and not getattr(self, "_dbg_marlin_once", False):
-            self._dbg_marlin_once = True
-            print("[adallm-plugin] MARLIN path ACTIVE (first call)", flush=True)
-        return marlin_vendored.marlin_linear(layer, x, bias)
+        return (
+            self._fallback_matmul(layer, x, bias)
+            if not getattr(layer, "marlin_ready", False)
+            else marlin_vendored.marlin_linear(layer, x, bias)
+        )
 
     @staticmethod
     def _fallback_matmul(layer, x, bias):
+        """Graph-safe dequant fallback (profiling/dummy-weights passes only).
+
+        Round11: the original version did `_E2M1_LUT.to(device)` and
+        `.item()` on scale_2 — both create CPU<->CUDA syncs/copies that
+        CRASH CUDA graph capture ("Cannot copy between CPU and CUDA tensors
+        during CUDA graph capture"). Now: LUT cached on-device, scale_2
+        consumed as a 0-dim GPU tensor, no host syncs.
+        """
         import torch.nn.functional as F
 
         w8 = layer.weight
@@ -139,18 +142,23 @@ class AdallmMarlinNvFp4LinearKernel:
         lo = (w8 & 0x0F).long()
         hi = (w8 >> 4).long()
         idx = torch.stack([lo, hi], dim=-1).reshape(N, K)
-        from .tests_lut import _E2M1_LUT  # cheap lazy import
 
-        base = _E2M1_LUT.to(x.device)[idx]
+        lut = getattr(AdallmMarlinNvFp4LinearKernel, "_lut_cache", None)
+        if lut is None or lut.device != x.device:
+            from .tests_lut import _E2M1_LUT
+
+            lut = _E2M1_LUT.to(x.device, non_blocking=False)
+            AdallmMarlinNvFp4LinearKernel._lut_cache = lut
+        base = lut[idx]
+
         s = layer.weight_scale
         if s.dtype == torch.float8_e4m3fn:
             s = s.float()
         s2 = getattr(layer, "weight_scale_2", None)
-        s2v = (
-            float(s2.reshape(-1)[0].item())
-            if s2 is not None and s2.numel()
-            else 1.0
-        )
+        if s2 is not None and s2.numel():
+            s2v = s2.reshape(-1)[0].to(x.device, dtype=torch.float32)
+        else:
+            s2v = torch.ones((), device=x.device, dtype=torch.float32)
         w = (base.float() * s.float().repeat_interleave(16, dim=1) * s2v).to(
             x.dtype
         )
