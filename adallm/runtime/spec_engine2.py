@@ -295,9 +295,13 @@ class SpecEngine2:
         replay if captured, else eager. Returns hidden [span, H]."""
         bs = input_ids.shape[0]
         entry = getattr(self.mr, "verify_graphs", {}).get(bs)
-        if entry is not None and os.getenv("ADALLM_MTP_GRAPH", "0") == "1":
+        ctx = get_context()
+        if (entry is not None and os.getenv("ADALLM_MTP_GRAPH", "0") == "1"
+                and ctx.slot_mapping is not None
+                and ctx.delta_slots is not None
+                and ctx.block_tables is not None
+                and ctx.cu_seqlens_k is not None):
             graph, gv = entry
-            ctx = get_context()
             gv["input_ids"].copy_(input_ids)
             gv["positions"].copy_(positions)
             gv["slot_mapping"][:] = ctx.slot_mapping
@@ -373,13 +377,14 @@ class SpecEngine2:
         sched.chunked.append(seq)
         seqs_now, is_prefill = sched.schedule()
         assert is_prefill and seqs_now and seqs_now[0] is seq and len(seqs_now) == 1
+        # Round8-C L1b: capture BEFORE prepare_prefill — capture_verify_graph
+        # ends with reset_context(), which would wipe the context prepare set.
+        if os.getenv("ADALLM_MTP_GRAPH", "0") == "1" and \
+                (k + 1) not in getattr(mr, "verify_graphs", {}):
+            self._ensure_verify_graph(k + 1)
         input_ids, positions = mr.prepare_prefill(seqs_now)
         _t0 = time.perf_counter()
         with torch.inference_mode():
-            # Round8-C L1b: graphed verify (fixed span k+1) if enabled+captured
-            if os.getenv("ADALLM_MTP_GRAPH", "0") == "1" and \
-                    getattr(mr, "verify_graph", None) is None:
-                self._ensure_verify_graph(k + 1)
             hidden = self._verify_forward(input_ids, positions)     # [k+1, H]
             logits = hidden.to(self.lm_head_w.dtype) @ self.lm_head_w.t()
         torch.cuda.synchronize(); self.stats["t_verify"] += time.perf_counter() - _t0
@@ -558,11 +563,14 @@ class SpecEngine2:
                 sched.chunked.append(seq)
                 seqs_r, is_p = sched.schedule()
                 assert is_p and seqs_r and seqs_r[0] is seq
+                # Round8-C L1b: capture BEFORE prepare_prefill (capture ends
+                # with reset_context() which would wipe the just-set context)
+                span_r = len(replay_tokens)
+                if os.getenv("ADALLM_MTP_GRAPH", "0") == "1" and \
+                        span_r not in getattr(mr, "verify_graphs", {}):
+                    self._ensure_verify_graph(span_r)
                 in_r, pos_r = mr.prepare_prefill(seqs_r)
                 assert in_r.tolist() == replay_tokens, f"replay span {in_r.tolist()} != {replay_tokens}"
-                # Round8-C L1b: graphed replay (fixed span a+1) when enabled
-                if os.getenv("ADALLM_MTP_GRAPH", "0") == "1" and in_r.shape[0] not in getattr(mr, "verify_graphs", {}):
-                    self._ensure_verify_graph(in_r.shape[0])
                 h_replay = self._span_forward(in_r, pos_r)     # [a+1, H]; last row = hidden at f_acc pos
                 # re-append the correction (unprocessed, as intended)
                 self._reconcile_blocks(seq)
