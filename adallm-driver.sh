@@ -30,6 +30,11 @@ while [[ $# -gt 0 ]]; do
             # mm-go injects --reasoning on|off for benchmark thinking control.
             # Map to env; serve.py turns it into enable_thinking template kwarg.
             ADALLM_REASONING="$2"; export ADALLM_REASONING; shift 2 ;;
+        --tensor-parallel-size)
+            # TP>1 requires both GPUs visible (round8-D/E) — set ADALLM_TP so
+            # CUDA_VISIBLE_DEVICES picks up both devices below.
+            ADALLM_TP="$2"; export ADALLM_TP
+            EXTRA+=("--tensor-parallel-size" "$2"); shift 2 ;;
         *) shift ;;
     esac
 done
@@ -45,7 +50,11 @@ export ADALLM_MARLIN=${ADALLM_MARLIN:-1}  # Marlin NVFP4 kernel: 22.9 tok/s sing
 export ADALLM_NO_COMPILE=1   # inductor fork-pool deadlocks under server load
 export ADALLM_NO_PIN=1       # pinned allocs from engine thread can deadlock
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export CUDA_VISIBLE_DEVICES=0
+if [[ "${ADALLM_TP:-}" == "2" ]]; then
+    export CUDA_VISIBLE_DEVICES=0,1   # TP=2 (round8-D/E): both GPUs
+else
+    export CUDA_VISIBLE_DEVICES=0
+fi
 # Per-model Marlin gate (2026-10-23): compressed-tensors (QUASAR) AND modelopt
 # (official NVFP4 export) produce garbage ("!!!!") under the Marlin kernel;
 # only the QAT custom format is Marlin-safe. Bisected on GPU1 + confirmed live
