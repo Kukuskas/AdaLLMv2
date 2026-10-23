@@ -10,7 +10,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 import uvicorn
 
 from adallm import AdaLLM, SamplingParams
@@ -28,11 +28,47 @@ class CompletionRequest(BaseModel):
     stream: bool = False
 
 
+def _flatten_content(content: str | list | None) -> tuple[str | None, list[str]]:
+    """Accept OpenAI multimodal content: string or list of parts.
+    Text parts are concatenated; image_url parts are collected (and currently
+    DROPPED with a log line — the engine loads text weights only; the vision
+    tower is skipped by the loader). Returns (text_content, dropped_image_urls).
+    """
+    if content is None:
+        return None, []
+    if isinstance(content, str):
+        return content, []
+    if isinstance(content, list):
+        texts: list[str] = []
+        imgs: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            t = part.get("type")
+            if t == "text" and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+            elif t == "image_url":
+                url = (part.get("image_url") or {}).get("url")
+                if isinstance(url, str):
+                    imgs.append(url[:80])
+        if imgs:
+            print(f"[vision] {len(imgs)} image part(s) dropped — engine is text-only "
+                  f"(vision tower not loaded): {imgs[:2]}", file=sys.stderr, flush=True)
+        return ("\n".join(texts) if texts else None), imgs
+    return str(content), []
+
+
 class ChatMessage(BaseModel):
     role: str
-    content: str | None = None
+    content: str | list[dict[str, Any]] | None = None
     tool_calls: list[dict[str, Any]] | None = None
     name: str | None = None
+
+    @model_validator(mode="after")
+    def _flatten(self) -> "ChatMessage":
+        text, _ = _flatten_content(self.content)
+        self.content = text
+        return self
 
 
 class ChatCompletionRequest(BaseModel):
