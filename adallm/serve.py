@@ -10,7 +10,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 import uvicorn
 
 from adallm import AdaLLM, SamplingParams
@@ -28,11 +28,47 @@ class CompletionRequest(BaseModel):
     stream: bool = False
 
 
+def _flatten_content(content: str | list | None) -> tuple[str | None, list[str]]:
+    """Accept OpenAI multimodal content: string or list of parts.
+    Text parts are concatenated; image_url parts are collected (and currently
+    DROPPED with a log line — the engine loads text weights only; the vision
+    tower is skipped by the loader). Returns (text_content, dropped_image_urls).
+    """
+    if content is None:
+        return None, []
+    if isinstance(content, str):
+        return content, []
+    if isinstance(content, list):
+        texts: list[str] = []
+        imgs: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            t = part.get("type")
+            if t == "text" and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+            elif t == "image_url":
+                url = (part.get("image_url") or {}).get("url")
+                if isinstance(url, str):
+                    imgs.append(url[:80])
+        if imgs:
+            print(f"[vision] {len(imgs)} image part(s) dropped — engine is text-only "
+                  f"(vision tower not loaded): {imgs[:2]}", file=sys.stderr, flush=True)
+        return ("\n".join(texts) if texts else None), imgs
+    return str(content), []
+
+
 class ChatMessage(BaseModel):
     role: str
-    content: str | None = None
+    content: str | list[dict[str, Any]] | None = None
     tool_calls: list[dict[str, Any]] | None = None
     name: str | None = None
+
+    @model_validator(mode="after")
+    def _flatten(self) -> "ChatMessage":
+        text, _ = _flatten_content(self.content)
+        self.content = text
+        return self
 
 
 class ChatCompletionRequest(BaseModel):
@@ -99,12 +135,43 @@ def _build_chat_prompt(
     if tokenizer is not None and getattr(tokenizer, "chat_template", None):
         hf_messages = [_hf_message(m) for m in messages]
         kwargs = dict(template_kwargs or {})
-        # tool_choice='none' suppresses tool rendering entirely; 'auto'/'required'
-        # are prompt-level concepts here — Qwen renders tools and the model decides.
+        # tool_choice='none' suppresses tool rendering entirely.
+        # 'auto' = model decides (Qwen default — no directive needed).
+        # 'required' / {'type':'function','function':{'name':X}} = MUST call;
+        # the Qwen template has no tool_choice knob, so enforce prompt-level:
+        # append a directive the template order guarantees lands after tools.
+        directive = None
         if tool_choice == "none":
             tools = None
+        elif tool_choice == "required":
+            directive = (
+                "You MUST call one of the available tools to answer. "
+                "Do not reply with plain text only; emit the tool call."
+            )
+        elif isinstance(tool_choice, dict):
+            fn = (tool_choice.get("function") or {})
+            name = fn.get("name") or tool_choice.get("name")
+            if tool_choice.get("type") == "function" and name:
+                directive = (
+                    f"You MUST call the tool \"{name}\" (it is the only tool you may "
+                    "call). Emit the tool call; do not reply with plain text only."
+                )
         if tools is not None:
             kwargs["tools"] = tools
+        if directive:
+            # System message wins: if the client already supplied one, append;
+            # otherwise insert one before the first user/tool message.
+            sys_txt = None
+            for i, m in enumerate(hf_messages):
+                if m.get("role") == "system":
+                    sys_txt = i
+                    break
+            if sys_txt is not None:
+                hf_messages[sys_txt]["content"] = (
+                    (hf_messages[sys_txt].get("content") or "") + "\n\n" + directive
+                )
+            else:
+                hf_messages.insert(0, {"role": "system", "content": directive})
         try:
             return tokenizer.apply_chat_template(
                 hf_messages,
