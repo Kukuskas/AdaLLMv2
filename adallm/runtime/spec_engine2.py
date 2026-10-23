@@ -606,8 +606,26 @@ class SpecEngine2:
             if blk not in bm.free_block_ids:
                 bm.free_block_ids.append(blk)
         # invariant: entering the decode schedule, table covers exactly the
-        # blocks may_append will need (lagged by one iff N % bs == 1)
-        assert len(seq.block_table) == seq.num_blocks - (seq.num_tokens % bm.block_size == 1)
+        # blocks may_append will need (lagged by one iff N % bs == 1).
+        # Round8-C: at exact block boundaries (N % bs == 0) the verify append
+        # dance can leave the table 1-2 entries AHEAD (blocks allocated for
+        # tokens the fallback restore already removed). Instead of asserting,
+        # REPAIR to the arithmetic expectation: free surplus trailing blocks,
+        # allocate missing ones (only when N % bs == 1, matching plain decode).
+        _need = seq.num_blocks - (seq.num_tokens % bm.block_size == 1)
+        while len(seq.block_table) > _need:
+            blk = seq.block_table.pop()
+            _b = bm.blocks[blk]
+            if _b.hash != -1:
+                bm.hash_to_block_id.pop(_b.hash, None)
+            _b.reset()
+            if blk not in bm.free_block_ids:
+                bm.free_block_ids.append(blk)
+        while len(seq.block_table) < _need:
+            nb = bm._allocate_block(bm.free_block_ids[0])
+            nb.precision = bm._precision_for_block_index(
+                len(seq.block_table), len(seq.block_table) + 1)
+            seq.block_table.append(nb.block_id)
         self._reconcile_blocks(seq, next_len=seq.num_tokens)
         _t0 = time.perf_counter()
         seqs_d, is_dec = sched.schedule()
