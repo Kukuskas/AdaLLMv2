@@ -23,7 +23,7 @@ from adallm.architectures.qwen3 import (
 from adallm.architectures.qwen3 import Qwen3MLP
 from adallm.ops.attention import Attention
 from adallm.ops.layernorm import RMSNorm, GemmaRMSNorm
-from adallm.ops.linear import RowParallelLinear, ReplicatedLinear, pair_linear
+from adallm.ops.linear import RowParallelLinear, ReplicatedLinear, ColumnParallelLinear, pair_linear
 from adallm.infra.context import get_context
 
 try:
@@ -101,7 +101,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
         self.A_log = nn.Parameter(torch.zeros(self.num_v_heads))
         self.norm = Qwen3NextRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
-        self.out_proj = RowParallelLinear(self.value_dim, self.hidden_size, bias=False)
+        # Round8-D (TP=2): out_proj must be REPLICATED, not RowParallel. The
+        # value heads are NOT sharded across TP ranks (in_proj_qkv/z/b/a are
+        # replicated, delta state pool is per-rank full-copy), so the
+        # activation entering out_proj is full-size (value_dim). A RowParallel
+        # out_proj sharded its K to value_dim/world_size → marlin shape
+        # mismatch (a.size(1)=6144 vs size_k=3072) at TP=2. Keep the
+        # computation replicated; the all-reduce savings on this one layer
+        # per delta block are not worth the head-sharding surgery yet.
+        self.out_proj = ReplicatedLinear(self.value_dim, self.hidden_size, bias=False)
 
         # CUDA-graph-safe recurrent state pool (vLLM mamba-style):
         #   mamba_state: [num_slots, HV, V, K]; conv_state: [num_slots, conv_dim, kernel-1]
@@ -255,9 +263,25 @@ class Qwen3_5Attention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.scaling = self.head_dim ** -0.5
 
-        self.q_proj = ReplicatedLinear(config.hidden_size, config.num_attention_heads * self.head_dim * 2, bias=False)
-        self.k_proj = ReplicatedLinear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = ReplicatedLinear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
+        # Round8-D (TP=2): attention projections must be CONSISTENT under TP.
+        # q/k/v ColumnParallel-shard the heads (24→12, 4→2 per rank — q emits
+        # 2x head_dim per head for the sigmoid gate, still shardable) so the
+        # activation entering o_proj is num_heads/tp * head_dim, matching
+        # o_proj's RowParallel K. Single-GPU (tp==1) keeps the original
+        # replicated q/k/v — bitwise-identical to the tuned prod stack.
+        import torch.distributed as _dist
+        _tp = _dist.get_world_size() if _dist.is_initialized() else 1
+        if _tp > 1:
+            from adallm.ops.linear import QKVParallelLinear
+            self.q_proj = ColumnParallelLinear(config.hidden_size, config.num_attention_heads * self.head_dim * 2, bias=False)
+            self.k_proj = ColumnParallelLinear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
+            self.v_proj = ColumnParallelLinear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
+            self.num_heads = config.num_attention_heads // _tp
+            self.num_kv_heads = config.num_key_value_heads // _tp
+        else:
+            self.q_proj = ReplicatedLinear(config.hidden_size, config.num_attention_heads * self.head_dim * 2, bias=False)
+            self.k_proj = ReplicatedLinear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
+            self.v_proj = ReplicatedLinear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = RowParallelLinear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
         # qwen3_5 norms are zero-centered: y = x_hat * (1 + w)
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -303,10 +327,22 @@ class Qwen3_5MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        from adallm.ops.linear import ReplicatedLinear, RowParallelLinear
+        from adallm.ops.linear import ReplicatedLinear, RowParallelLinear, ColumnParallelLinear
+        import torch.distributed as _dist
         from adallm.ops.activation import SiluAndMul
-        self.gate_proj = ReplicatedLinear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = ReplicatedLinear(config.hidden_size, config.intermediate_size, bias=False)
+        # Round8-D (TP=2): at world_size>1, gate/up MUST be ColumnParallel so
+        # the activation entering down_proj is intermediate_size/world_size,
+        # matching down_proj's sharded K (QUASAR's per-projection global
+        # scales still work: sharding is along the output dim, scales slice
+        # with it). Single-GPU path (world_size==1) keeps ReplicatedLinear —
+        # bitwise-identical to the tuned single-GPU stack.
+        _tp = _dist.get_world_size() if _dist.is_initialized() else 1
+        if _tp > 1:
+            self.gate_proj = ColumnParallelLinear(config.hidden_size, config.intermediate_size, bias=False)
+            self.up_proj = ColumnParallelLinear(config.hidden_size, config.intermediate_size, bias=False)
+        else:
+            self.gate_proj = ReplicatedLinear(config.hidden_size, config.intermediate_size, bias=False)
+            self.up_proj = ReplicatedLinear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = RowParallelLinear(config.intermediate_size, config.hidden_size, bias=False)
         self.act_fn = SiluAndMul()
 
