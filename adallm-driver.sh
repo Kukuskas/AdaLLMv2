@@ -18,7 +18,7 @@ while [[ $# -gt 0 ]]; do
         --port)   PORT="$2"; shift 2 ;;
         # safelisted adallm serve flags (pass through with their value)
         --max-model-len|--max-num-seqs|--max-num-batched-tokens|\
-        --gpu-memory-utilization|--tensor-parallel-size|--kv-cache-dtype|\
+        --gpu-memory-utilization|--kv-cache-dtype|\
         --kv-cache-max-blocks|--fp8-decode-kernel-min-ctx)
             EXTRA+=("$1" "$2"); shift 2 ;;
         --enforce-eager|--no-fp8-decode-kernel-enabled|--fp8-decode-kernel-enabled)
