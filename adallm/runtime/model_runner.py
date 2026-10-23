@@ -394,16 +394,21 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_verify_graph(self, span_rows: int = 4):
-        """Round8-A (lever 1): CUDA graph for the MTP verify forward — a
-        FIXED-shape prefill-continuation of `span_rows` tokens (k+1) for a
-        single sequence. Static buffers: input_ids/positions (copied in per
-        step), slot_mapping, cu_seqlens (fixed [0, span] / [0, ctx]),
-        block_tables row, delta slot; output hidden states exposed via
-        self.verify_graph_vars so the spec engine reads them without an
-        eager forward. max_seqlen_k is static (full context) — flash varlen
-        only uses it as a hint, correctness unaffected."""
+        """Round8-A/C (lever 1): CUDA graph for a FIXED-shape span-row
+        prefill-continuation forward (MTP verify k+1 / replay a+1) for a
+        single sequence. Multiple spans are kept in self.verify_graphs
+        (span -> (graph, gv)); the legacy single-graph attributes
+        (verify_graph/verify_graph_vars) point at the most recent capture
+        for backward compat. Static buffers per span; slot_mapping filled
+        with -1 during capture warmup (store kernel skips negatives — no
+        KV corruption); delta writes during warmup land in NULL slot 0,
+        re-zeroed after capture."""
         if self.enforce_eager:
             return False
+        if span_rows in self.verify_graphs:
+            g, gv = self.verify_graphs[span_rows]
+            self.verify_graph, self.verify_graph_vars = g, gv
+            return True
         dev = "cuda"
         bs = span_rows
         max_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size
@@ -441,6 +446,7 @@ class ModelRunner:
                 gv["hidden"] = self.model(gv["input_ids"], gv["positions"])
             self.verify_graph = graph
             self.verify_graph_vars = gv
+            self.verify_graphs[span_rows] = (graph, gv)
             # capture warmup wrote window/state rows into the reserved NULL
             # delta slot 0 (prefill branch index_copy_ doesn't skip 0) —
             # restore the always-zero invariant.
@@ -527,6 +533,7 @@ class ModelRunner:
         self.graph_pool = None
         self.verify_graph = None
         self.verify_graph_vars = None
+        self.verify_graphs = {}          # Round8-C: span -> (graph, gv)
         # Round4-B: static buffers for in-graph lm_head + sampler
         sample_ids = torch.zeros(max_bs, dtype=torch.int64)
         temperatures = torch.ones(max_bs, dtype=torch.float32)

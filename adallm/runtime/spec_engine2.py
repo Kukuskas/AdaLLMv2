@@ -276,32 +276,28 @@ class SpecEngine2:
                 del bm.hash_to_block_id[last.hash]
             last.reset()
 
-    # ---------- L1b: graphed verify forward ----------
+    # ---------- L1b: graphed verify/replay forwards ----------
 
     def _ensure_verify_graph(self, span: int):
-        """Capture (once) the fixed-shape span-row verify forward. Requires
-        enforce_eager=False engine and ADALLM_PAGED_VERIFY attention (the
-        paged splitk path is device-indexed, capture-safe; the gather path
-        has .item() syncs and cannot be captured)."""
-        if getattr(self.mr, "verify_graph", None) is not None:
-            return self.mr.verify_graph_vars
+        """Capture (once per span) the fixed-shape span-row continuation
+        forward. Requires non-eager engine + ADALLM_PAGED_VERIFY (the paged
+        splitk path is device-indexed, capture-safe; the gather path has
+        .item() syncs and cannot be captured)."""
         try:
             ok = self.mr.capture_verify_graph(span_rows=span)
         except Exception as e:
             _dbg(f"verify-graph capture failed: {e!r}")
             ok = False
-        if not ok:
-            return None
-        return self.mr.verify_graph_vars
+        return self.mr.verify_graph_vars if ok else None
 
-    def _verify_forward(self, input_ids: torch.Tensor, positions: torch.Tensor):
-        """4-row verify forward: graph replay if available, else eager.
-        Returns hidden [span, H]."""
-        gv = getattr(self.mr, "verify_graph_vars", None)
-        graph = getattr(self.mr, "verify_graph", None)
-        if gv is not None and graph is not None and input_ids.shape[0] == gv["input_ids"].shape[0]:
+    def _span_forward(self, input_ids: torch.Tensor, positions: torch.Tensor):
+        """Fixed-shape span-row prefill-continuation forward: per-span graph
+        replay if captured, else eager. Returns hidden [span, H]."""
+        bs = input_ids.shape[0]
+        entry = getattr(self.mr, "verify_graphs", {}).get(bs)
+        if entry is not None and os.getenv("ADALLM_MTP_GRAPH", "0") == "1":
+            graph, gv = entry
             ctx = get_context()
-            bs = input_ids.shape[0]
             gv["input_ids"].copy_(input_ids)
             gv["positions"].copy_(positions)
             gv["slot_mapping"][:] = ctx.slot_mapping
@@ -309,12 +305,15 @@ class SpecEngine2:
             bt = ctx.block_tables
             gv["block_tables"].zero_()
             gv["block_tables"][0, : bt.shape[1]].copy_(bt[0])
-            # cu_k[1] = start + n_q: device copy from the live context
             gv["cu_k"][1] = ctx.cu_seqlens_k[1]
             graph.replay()
             return gv["hidden"]
         hidden = self.mr.model(input_ids, positions)
         return hidden
+
+    def _verify_forward(self, input_ids: torch.Tensor, positions: torch.Tensor):
+        """Backward-compat alias: 4-row verify via _span_forward."""
+        return self._span_forward(input_ids, positions)
 
     # ---------- spec step ----------
 
@@ -561,7 +560,10 @@ class SpecEngine2:
                 assert is_p and seqs_r and seqs_r[0] is seq
                 in_r, pos_r = mr.prepare_prefill(seqs_r)
                 assert in_r.tolist() == replay_tokens, f"replay span {in_r.tolist()} != {replay_tokens}"
-                h_replay = mr.model(in_r, pos_r)     # [a+1, H]; last row = hidden at f_acc pos
+                # Round8-C L1b: graphed replay (fixed span a+1) when enabled
+                if os.getenv("ADALLM_MTP_GRAPH", "0") == "1" and in_r.shape[0] not in getattr(mr, "verify_graphs", {}):
+                    self._ensure_verify_graph(in_r.shape[0])
+                h_replay = self._span_forward(in_r, pos_r)     # [a+1, H]; last row = hidden at f_acc pos
                 # re-append the correction (unprocessed, as intended)
                 self._reconcile_blocks(seq)
                 seq.append_token(correction_tok)
