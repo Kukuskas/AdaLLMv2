@@ -135,12 +135,43 @@ def _build_chat_prompt(
     if tokenizer is not None and getattr(tokenizer, "chat_template", None):
         hf_messages = [_hf_message(m) for m in messages]
         kwargs = dict(template_kwargs or {})
-        # tool_choice='none' suppresses tool rendering entirely; 'auto'/'required'
-        # are prompt-level concepts here — Qwen renders tools and the model decides.
+        # tool_choice='none' suppresses tool rendering entirely.
+        # 'auto' = model decides (Qwen default — no directive needed).
+        # 'required' / {'type':'function','function':{'name':X}} = MUST call;
+        # the Qwen template has no tool_choice knob, so enforce prompt-level:
+        # append a directive the template order guarantees lands after tools.
+        directive = None
         if tool_choice == "none":
             tools = None
+        elif tool_choice == "required":
+            directive = (
+                "You MUST call one of the available tools to answer. "
+                "Do not reply with plain text only; emit the tool call."
+            )
+        elif isinstance(tool_choice, dict):
+            fn = (tool_choice.get("function") or {})
+            name = fn.get("name") or tool_choice.get("name")
+            if tool_choice.get("type") == "function" and name:
+                directive = (
+                    f"You MUST call the tool \"{name}\" (it is the only tool you may "
+                    "call). Emit the tool call; do not reply with plain text only."
+                )
         if tools is not None:
             kwargs["tools"] = tools
+        if directive:
+            # System message wins: if the client already supplied one, append;
+            # otherwise insert one before the first user/tool message.
+            sys_txt = None
+            for i, m in enumerate(hf_messages):
+                if m.get("role") == "system":
+                    sys_txt = i
+                    break
+            if sys_txt is not None:
+                hf_messages[sys_txt]["content"] = (
+                    (hf_messages[sys_txt].get("content") or "") + "\n\n" + directive
+                )
+            else:
+                hf_messages.insert(0, {"role": "system", "content": directive})
         try:
             return tokenizer.apply_chat_template(
                 hf_messages,
