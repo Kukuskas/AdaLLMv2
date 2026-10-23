@@ -383,6 +383,59 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
+    def capture_verify_graph(self, span_rows: int = 4):
+        """Round8-A (lever 1): CUDA graph for the MTP verify forward — a
+        FIXED-shape prefill-continuation of `span_rows` tokens (k+1) for a
+        single sequence. Static buffers: input_ids/positions (copied in per
+        step), slot_mapping, cu_seqlens (fixed [0, span] / [0, ctx]),
+        block_tables row, delta slot; output hidden states exposed via
+        self.verify_graph_vars so the spec engine reads them without an
+        eager forward. max_seqlen_k is static (full context) — flash varlen
+        only uses it as a hint, correctness unaffected."""
+        if self.enforce_eager:
+            return False
+        dev = "cuda"
+        bs = span_rows
+        max_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size
+        gv = {
+            "input_ids": torch.zeros(bs, dtype=torch.int64, device=dev),
+            "positions": torch.arange(bs, dtype=torch.int64, device=dev),
+            "slot_mapping": torch.zeros(bs, dtype=torch.int32, device=dev),
+            "cu_q": torch.tensor([0, bs], dtype=torch.int32, device=dev),
+            "cu_k": torch.tensor([0, self.config.max_model_len], dtype=torch.int32, device=dev),
+            "block_tables": torch.zeros(1, max_blocks, dtype=torch.int32, device=dev),
+            "n_blocks_row": torch.zeros(1, dtype=torch.int32, device=dev),
+            "delta_slot": torch.zeros(1, dtype=torch.int64, device=dev),
+            "hidden": torch.zeros(bs, self.config.hf_config.hidden_size, device=dev),
+        }
+        # cu_seqlens_k must reflect actual k length: block-table gather path
+        # (prefix cache) uses cu_k[1:] - cu_k[:-1] as block counts. Use a
+        # dedicated static "k_len" we update per replay via n_blocks_row.
+        # For the no-prefix-cache path flash reads cu_k directly: we cap it
+        # with a large but valid value (max_model_len) — kernel treats it as
+        # max hint only when block_tables present.
+        try:
+            # warmup
+            set_context(True,
+                        cu_seqlens_q=gv["cu_q"], cu_seqlens_k=gv["cu_k"],
+                        max_seqlen_q=bs, max_seqlen_k=self.config.max_model_len,
+                        slot_mapping=gv["slot_mapping"], context_lens=None,
+                        block_tables=gv["block_tables"],
+                        delta_slots=gv["delta_slot"])
+            gv["hidden"] = self.model(gv["input_ids"], gv["positions"])
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, self.graph_pool):
+                gv["hidden"] = self.model(gv["input_ids"], gv["positions"])
+            self.verify_graph = graph
+            self.verify_graph_vars = gv
+            reset_context()
+            return True
+        except Exception as e:
+            print(f"[verify-graph] capture FAILED ({e!r}); MTP stays eager", flush=True)
+            reset_context()
+            return False
+
+    @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
@@ -451,6 +504,8 @@ class ModelRunner:
         self.graph_bs = [bs for bs in ([1, 2, 4, 8] + list(range(16, max_bs + 1, 16))) if bs <= max_bs]
         self.graphs = {}
         self.graph_pool = None
+        self.verify_graph = None
+        self.verify_graph_vars = None
         # Round4-B: static buffers for in-graph lm_head + sampler
         sample_ids = torch.zeros(max_bs, dtype=torch.int64)
         temperatures = torch.ones(max_bs, dtype=torch.float32)
