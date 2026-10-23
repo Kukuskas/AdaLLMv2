@@ -70,6 +70,14 @@ export ADALLM_FP16_ACT=${ADALLM_FP16_ACT:-1}         # fp16 activations end-to-e
 export ADALLM_LMHEAD_MARLIN=${ADALLM_LMHEAD_MARLIN:-1}  # lm_head NVFP4+Marlin (98% top-1)
 # --- concurrency: queue server + interleaved prefill (4 streams 152 tok/s agg) ---
 export ADALLM_QUEUE_SERVER=${ADALLM_QUEUE_SERVER:-1}
+# TP=2 (round8-D/E): queue server serializes into eager steps under TP (5 tok/s
+# measured vs 55 graphed direct) — disable it; _run_generate falls back to the
+# serialized llm.generate path with full CUDA graphs. Concurrency drops but
+# TP=2 single-stream is the point of this profile.
+if [[ "${ADALLM_TP:-}" == "2" ]]; then
+    unset ADALLM_QUEUE_SERVER   # serve.py checks bool(getenv) — '0' would be truthy
+    unset ADALLM_INTERLEAVE
+fi
 export ADALLM_INTERLEAVE=${ADALLM_INTERLEAVE:-2}
 export ADALLM_CHUNK_BUDGET=${ADALLM_CHUNK_BUDGET:-4096}
 # --- round4-b (2026-10-22): prefill +13-16%, -1.2GB VRAM, graph sampler ---
