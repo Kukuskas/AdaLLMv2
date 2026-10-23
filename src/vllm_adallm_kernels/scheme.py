@@ -73,7 +73,15 @@ class _BroadcastScaleParameter(PerTensorScaleParameter):
         super()._assert_and_load(loaded_weight)
 
 
-class AdallmMarlinLinearMethod:
+try:
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizeMethodBase as _QMB,
+    )
+except Exception:  # vLLM absent (unit tests) — degrade to plain class
+    _QMB = object
+
+
+class AdallmMarlinLinearMethod(_QMB):
     """W4A16 NVFP4 linear method: stock layout params + adallm repack.
 
     Params mirror KNvfp4Static.create_weights (modelopt.py): uint8 packed
@@ -83,6 +91,8 @@ class AdallmMarlinLinearMethod:
     runs in process_weights_after_loading.
     """
 
+    # (round11 bug fix: must subclass QuantizeMethodBase or vLLM's loader
+    # silently skips process_weights_after_loading -> 0.3 tok/s fallback)
     group_size = 16
 
     def __init__(self, quant_config: "AdallmMarlinConfigBase"):

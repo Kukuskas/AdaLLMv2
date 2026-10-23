@@ -118,7 +118,46 @@ class AdallmMarlinNvFp4LinearKernel:
     ) -> torch.Tensor:
         from . import marlin_vendored
 
+        if not getattr(layer, "marlin_ready", False):
+            import os as _os
+            if _os.getenv("ADALLM_PLUGIN_DEBUG"):
+                print(f"[adallm-plugin] FALLBACK path, weight {tuple(layer.weight.shape)}", flush=True)
+            return self._fallback_matmul(layer, x, bias)
+        import os as _os
+        if _os.getenv("ADALLM_PLUGIN_DEBUG") and not getattr(self, "_dbg_marlin_once", False):
+            self._dbg_marlin_once = True
+            print("[adallm-plugin] MARLIN path ACTIVE (first call)", flush=True)
         return marlin_vendored.marlin_linear(layer, x, bias)
+
+    @staticmethod
+    def _fallback_matmul(layer, x, bias):
+        import torch.nn.functional as F
+
+        w8 = layer.weight
+        N, K_half = w8.shape
+        K = K_half * 2
+        lo = (w8 & 0x0F).long()
+        hi = (w8 >> 4).long()
+        idx = torch.stack([lo, hi], dim=-1).reshape(N, K)
+        from .tests_lut import _E2M1_LUT  # cheap lazy import
+
+        base = _E2M1_LUT.to(x.device)[idx]
+        s = layer.weight_scale
+        if s.dtype == torch.float8_e4m3fn:
+            s = s.float()
+        s2 = getattr(layer, "weight_scale_2", None)
+        s2v = (
+            float(s2.reshape(-1)[0].item())
+            if s2 is not None and s2.numel()
+            else 1.0
+        )
+        w = (base.float() * s.float().repeat_interleave(16, dim=1) * s2v).to(
+            x.dtype
+        )
+        out = F.linear(x, w)
+        if bias is not None:
+            out = out + bias
+        return out
 
 
 __all__ = ["AdallmMarlinNvFp4LinearKernel"]
