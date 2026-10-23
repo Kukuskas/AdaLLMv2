@@ -46,6 +46,14 @@ export ADALLM_NO_COMPILE=1   # inductor fork-pool deadlocks under server load
 export ADALLM_NO_PIN=1       # pinned allocs from engine thread can deadlock
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0
+# Per-model Marlin gate (2026-10-23): compressed-tensors (QUASAR) AND modelopt
+# (official NVFP4 export) produce garbage ("!!!!") under the Marlin kernel;
+# only the QAT custom format is Marlin-safe. Bisected on GPU1 + confirmed live
+# on the official bench server (5804) 2026-10-23 05:40 UTC.
+case "$MODEL" in
+    *QUASAR*|*/Qwen3.8-27B-NVFP4) export ADALLM_MARLIN=0 ;;
+    *)                             export ADALLM_MARLIN=${ADALLM_MARLIN:-1} ;;
+esac
 # --- round2+3 speed stack (2026-10-22): 9.8 -> 34-37.5 tok/s single, 4-stream 152 agg ---
 export ADALLM_ATTN_SPLITK=${ADALLM_ATTN_SPLITK:-1}   # split-K flash decode: 4.8x@16K/9.4x@32K kernel
 export ADALLM_TINYGEMM=${ADALLM_TINYGEMM:-1}         # tiny-N dequant + cuBLAS + pair fusion
@@ -61,4 +69,14 @@ export ADALLM_MLP_NO_CAT=${ADALLM_MLP_NO_CAT:-1}     # silu(g)*u without cat rou
 export ADALLM_EMBED_FP8=${ADALLM_EMBED_FP8:-1}       # embedding fp8 (2.4->1.19 GiB, byte-identical outputs)
 # --- round5-b (2026-10-22): parallel prefill — mixed workloads 78->168 tok/s ---
 export ADALLM_PARALLEL_PREFILL=${ADALLM_PARALLEL_PREFILL:-1}
+# --- round8 (2026-10-23): MTP speculative decoding, graphed verify+replay.
+# OFF by default: single-stream only (spec engine assumes 1 running seq).
+# Verified on testbed: verify 185->28.8ms, replay 176->23.6ms, 74 vs 148 ms/tok
+# @28K ctx = 2.0x net win, token-identical output. Enable per-model via mm-go
+# params (env passthrough) ONLY for single-stream serving profiles.
+export ADALLM_MTP=${ADALLM_MTP:-0}
+export ADALLM_MTP_GRAPH=${ADALLM_MTP_GRAPH:-1}
+export ADALLM_PAGED_VERIFY=${ADALLM_PAGED_VERIFY:-1}
+# TP=2 (round8-D/E): off by default — requires mm-go to pass --tensor-parallel-size 2
+# and both GPUs. 55.8 tok/s single-stream with delta-net head sharding (99d8935).
 exec "$VENV/bin/python" -m adallm.cli serve "$MODEL" --host "$HOST" --port "$PORT" "${EXTRA[@]}"
