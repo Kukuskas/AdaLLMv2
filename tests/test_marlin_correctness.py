@@ -14,9 +14,6 @@ matmul. Tolerance reflects fp16 Marlin accumulation (~1e-2 relative).
 
 from __future__ import annotations
 
-import math
-import os
-
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -133,7 +130,6 @@ def test_marlin_scale_factor_guard():
     s = s * 1e-3
     layer = _FakeLinear(wq.cuda(), s.cuda(), 1.0, 16).to(dev)
     marlin_vendored.repack_linear(layer)
-    ws = layer.weight_scale.view(torch.float8_e4m3fn)
     # after repack, weight_scale is S0E5M3-packed; the guard is that the
     # GEMM still matches the reference (zeroed scales => all-zero output)
     x = torch.randn(2, K, dtype=torch.float16, device=dev)
