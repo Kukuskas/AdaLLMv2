@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vllm-adallm-kernels"
+version = "0.1.0"
+description = "adallm NVFP4 kernel stack (Marlin GEMM, splitK fp8-KV decode, LM-head Marlin) as a vLLM plugin for Ada (sm89) GPUs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = []
+
+[project.optional-dependencies]
+# vLLM 0.32.0 kernel layout (kernels/linear registry, marlin_utils_fp4).
+vllm = ["vllm>=0.32.0,<0.33"]
+test = ["pytest"]
+
+[project.entry-points."vllm.general_plugins"]
+adallm_kernels = "vllm_adallm_kernels.plugin:register"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vllm_adallm_kernels"]
