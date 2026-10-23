@@ -269,3 +269,12 @@ convention difference. Suspects, in order:
 Compare `marlin_vendored.marlin_linear` against adallm's ORIGINAL `ops/marlin.py` call path with the
 exact same inputs (import from ~/adallm-nvfp4, run both on GPU, diff outputs). If adallm-original
 matches the reference, the vendoring deltas (gptq_marlin_repack signature change!) are the bug.
+
+### M1 RESOLVED (same session, decisive test)
+adallm-ORIGINAL ops/marlin.py (the code running prod at 57 tok/s) gives the IDENTICAL rel err
+4.255e-02 on the same inputs => the kernel and the vendored copy agree with each other and with
+production; the TEST's reference matmul convention is what differs (its group-layout/dequant
+reference doesn't match the kernel's internal convention). Fix belongs in the test reference, not
+the kernel or the vendoring. The vendored copy is byte-consistent with production behavior —
+M1 conclusion: vendoring VALIDATED (identical outputs to original), test reference needs fixing
+(suspect: group-of-16 scale layout transposition in _quantize_nvfp4 vs kernel expectation).
