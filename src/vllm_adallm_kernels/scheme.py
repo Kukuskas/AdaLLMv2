@@ -58,6 +58,21 @@ except Exception as _e:  # pragma: no cover
 # Linear method (shared by both configs)
 # ---------------------------------------------------------------------------
 
+class _BroadcastScaleParameter(PerTensorScaleParameter):
+    """Per-tensor scale that accepts a 0-dim scalar for any partition count
+    (fused checkpoints ship ONE weight_scale_2 for a 5-way-fused in_proj)
+    and broadcasts it to every logical partition."""
+
+    def _assert_and_load(self, loaded_weight: torch.Tensor):
+        if loaded_weight.ndim == 0 and self.data.ndim >= 1:
+            self.data.fill_(loaded_weight)
+            return
+        if self.data.shape != loaded_weight.shape and self.data.numel() == 1:
+            self.data.copy_(loaded_weight.reshape(()))
+            return
+        super()._assert_and_load(loaded_weight)
+
+
 class AdallmMarlinLinearMethod:
     """W4A16 NVFP4 linear method: stock layout params + adallm repack.
 
@@ -130,7 +145,16 @@ class AdallmMarlinLinearMethod:
         )
         layer.register_parameter(
             "weight_scale_2",
-            PerTensorScaleParameter(
+            _BroadcastScaleParameter(
+                data=torch.ones(len(output_partition_sizes), dtype=torch.float32),
+                weight_loader=weight_loader,
+            ),
+        )
+        # W4A4-format checkpoints carry a per-tensor input_scale; our path is
+        # W4A16 (bf16/fp16 activations) so it is loaded and ignored.
+        layer.register_parameter(
+            "input_scale",
+            _BroadcastScaleParameter(
                 data=torch.ones(len(output_partition_sizes), dtype=torch.float32),
                 weight_loader=weight_loader,
             ),
@@ -166,6 +190,19 @@ class AdallmMarlinLinearMethod:
         return self.kernel.apply_weights(layer, x, bias)
 
 
+# Route loading through the v2 path (BasevLLMParameter semantics; the v1
+# MergedColumnParallelLinear loader cannot broadcast 0-dim scale_2 scalars
+# into multi-partition fused layers). Registered AFTER the class definition.
+try:
+    from vllm.model_executor.layers.linear import (
+        register_weight_loader_v2_supported_method,
+    )
+
+    register_weight_loader_v2_supported_method(AdallmMarlinLinearMethod)
+except Exception:
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Configs
 # ---------------------------------------------------------------------------
@@ -195,7 +232,7 @@ class AdallmMarlinConfigBase(QuantizationConfig):
     def get_quant_method(self, layer, prefix):
         if isinstance(layer, LinearBase):
             if self.is_layer_skipped(prefix):
-                from vllm.model_executor.layers.quantization.unquantized_linear import (
+                from vllm.model_executor.layers.linear import (
                     UnquantizedLinearMethod,
                 )
 
@@ -239,7 +276,21 @@ def _register() -> None:
 
         @classmethod
         def from_config(cls, config: dict[str, Any]) -> "AdallmModelOptNvFp4Config":
-            return cls(group_size=int(config.get("group_size", 16)))
+            q = config.get("quantization", config) if isinstance(config, dict) else {}
+            exclude = q.get("exclude_modules") if isinstance(q, dict) else None
+            group = q.get("group_size", 16) if isinstance(q, dict) else 16
+            if exclude:
+                # checkpoint excludes use the HF namespace (e.g. Nemotron's
+                # "backbone.layers.N..."); get_quant_method sees vLLM prefixes
+                exclude = [str(e).replace("backbone.", "model.") for e in exclude]
+                exclude.append("lm_head")
+            else:
+                exclude = ["lm_head"]
+            return cls(group_size=int(group), exclude_modules=exclude)
+
+        @classmethod
+        def get_config_filenames(cls) -> list[str]:
+            return ["hf_quant_config.json", "config.json"]
 
         @classmethod
         def override_quantization_method(cls, hf_quant_cfg, user_quant, hf_config=None):
@@ -257,11 +308,20 @@ def _register() -> None:
 
 
 def _extract_fp4_algo(hf_quant_cfg) -> str | None:
-    """ModelOptNvFp4Config._extract_modelopt_quant_algo equivalent (light)."""
+    """ModelOptNvFp4Config._extract_modelopt_quant_algo equivalent (light).
+
+    hf_quant_config.json layout: {"producer": {...}, "quantization":
+    {"quant_algo": "NVFP4", ...}}; some checkpoints also put quant_algo at
+    the top level or in config.json's quantization_config.
+    """
     if hf_quant_cfg is None:
         return None
-    if "quant_algo" in hf_quant_cfg:
-        return str(hf_quant_cfg.get("quant_algo"))
+    for d in (
+        hf_quant_cfg,
+        hf_quant_cfg.get("quantization") or {},
+    ):
+        if isinstance(d, dict) and d.get("quant_algo"):
+            return str(d["quant_algo"])
     return None
 
 
