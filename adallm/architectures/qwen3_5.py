@@ -146,12 +146,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             cu = context.cu_seqlens_q
             n_seqs = cu.shape[0] - 1
             slots = context.delta_slots              # [n_seqs] int64
+            # Round8-C: host mirrors (prepare_prefill builds these from Python
+            # lists) — avoids per-layer .item()/int() device syncs AND makes
+            # this branch graph-capture-safe. Fall back to device reads only
+            # when a caller set context manually without mirrors.
+            cu_host = context.cu_q_list
+            slots_host = context.slots_list
+            if cu_host is not None and slots_host is not None and len(cu_host) == n_seqs + 1:
+                bounds = [(cu_host[i], cu_host[i + 1], slots_host[i]) for i in range(n_seqs)]
+                lens = [s1 - s0 for s0, s1, _ in bounds]
+            else:
+                bounds = [(int(cu[i]), int(cu[i + 1]), int(slots[i])) for i in range(n_seqs)]
+                lens = [s1 - s0 for s0, s1, _ in bounds]
             conv_out = torch.empty_like(mixed_qkv)
             weight = self.conv1d.weight.squeeze(1)   # [conv_dim, kernel]
             kml1 = self.conv_kernel_size - 1
-            for i in range(n_seqs):
-                s0, s1 = int(cu[i]), int(cu[i + 1])
-                slot = int(slots[i])
+            for s0, s1, slot in bounds:
                 x = mixed_qkv[s0:s1].transpose(0, 1)                 # [conv_dim, T]
                 prev = self.conv_state[slot]                         # zeros for fresh seqs
                 window = torch.cat([prev, x], dim=-1)                # [conv_dim, T+k-1]
@@ -169,11 +179,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
             # Kernel reads ssm_state_indices[i_n, i_t] per token → needs a 2-D
             # [N, T] tensor (1-D would read OOB at i_t > 0 → illegal access).
-            lens = [int(cu[i + 1] - cu[i]) for i in range(n_seqs)]
             max_len = max(lens) if lens else 1
             idx2d = slots.new_zeros(n_seqs, max(max_len, 1))
-            for i in range(n_seqs):
-                idx2d[i, : lens[i]] = slots[i]
+            for i, (s0, s1, slot) in enumerate(bounds):
+                idx2d[i, : s1 - s0] = slot
 
             core_attn_out, _ = fused_recurrent_gated_delta_rule(
                 q=q.contiguous(), k=k.contiguous(), v=v.contiguous(),

@@ -13,6 +13,11 @@ class Context:
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
     delta_slots: torch.Tensor | None = None    # [N] int64 state-pool slot per sequence
+    # Round8-C: host mirrors (Python ints) for graph-capture-unsafe host reads.
+    # Populated by prepare_prefill/prepare_decode which build them from lists.
+    cu_q_list: list | None = None              # [n_seqs+1] chunk-relative q offsets
+    slots_list: list | None = None             # [n_seqs] delta slot ids
+    q_len_list: list | None = None             # [n_seqs] chunk lengths
 
 _CONTEXT = Context()
 
@@ -29,6 +34,9 @@ def set_context(
     context_lens=None,
     block_tables=None,
     delta_slots=None,
+    cu_q_list=None,
+    slots_list=None,
+    q_len_list=None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -41,6 +49,9 @@ def set_context(
         context_lens,
         block_tables,
         delta_slots,
+        cu_q_list,
+        slots_list,
+        q_len_list,
     )
 
 def reset_context():

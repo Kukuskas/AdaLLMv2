@@ -350,11 +350,14 @@ class ModelRunner:
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=_PIN).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=_PIN).cuda(non_blocking=True)
+        cu_q_host, slots_host = list(cu_seqlens_q), list(delta_slots)
+        q_len_host = [cu_q_host[i + 1] - cu_q_host[i] for i in range(len(slots_host))]
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=_PIN).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=_PIN).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=_PIN).cuda(non_blocking=True)
         delta_slots = torch.tensor(delta_slots, dtype=torch.int64, pin_memory=_PIN).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, delta_slots)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, delta_slots,
+                    cu_q_list=cu_q_host, slots_list=slots_host, q_len_list=q_len_host)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):

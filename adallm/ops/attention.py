@@ -672,14 +672,13 @@ class Attention(nn.Module):
                     k, v = k_cache_compute, v_cache_compute
                     seqused_k = None
                     if cu_seqlens_k is not None and cu_seqlens_k.numel() >= 2:
-                        # vllm flash requires seqused_k with block_table
+                        # vllm flash with block_table needs seqused_k INSTEAD of cu_seqlens_k
                         seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
                     o = flash_attn_varlen_func(
                         q, k, v,
                         max_seqlen_q=context.max_seqlen_q,
                         cu_seqlens_q=context.cu_seqlens_q,
                         max_seqlen_k=context.max_seqlen_k,
-                        cu_seqlens_k=cu_seqlens_k,
                         seqused_k=seqused_k,
                         softmax_scale=self.scale,
                         causal=True,
