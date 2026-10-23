@@ -14,6 +14,10 @@ def build_model(hf_config):
         text_cfg = getattr(hf_config, "text_config", None) or hf_config
         return Qwen3_5ForCausalLM(text_cfg, max_position=getattr(hf_config, "max_model_len", None)), False
 
+    if model_type == "qwen4_exp":
+        from adallm.architectures.qwen4_exp import Qwen4ExpForCausalLM
+        return Qwen4ExpForCausalLM(hf_config, max_position=getattr(hf_config, "max_model_len", None)), True
+
     is_next = model_type == "qwen3_next"
     is_moe = isinstance(hf_config, Qwen3MoeConfig) or model_type in ("qwen3_moe", "qwen3_next")
     if is_moe:

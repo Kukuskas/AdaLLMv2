@@ -80,6 +80,13 @@ class ModelRunner:
         self.model, self.is_moe = build_model(hf_config)
         if self.is_moe and hf_config.moe_offload_experts:
             self.enforce_eager = True
+        self.is_q4e = getattr(hf_config, "model_type", "") == "qwen4_exp"
+        self.ple_needs_ids = False
+        if self.is_q4e:
+            # EP experts are GPU-resident; never offload. Eager off for now
+            # (graphs may work - decode is graph-safe by design; first
+            # bring-up runs eager, then we capture).
+            hf_config.moe_offload_experts = False
         load_model(self.model, config.model)
         self.sampler = Sampler()
         # Materialize lazily-created device constants (FP4 LUT) before any
@@ -217,6 +224,16 @@ class ModelRunner:
         self.delta_num_layers = len(delta_modules)
         self.delta_modules = delta_modules
         self.graph_delta_slots = torch.zeros(num_delta_slots, dtype=torch.int64, device=self.kv_cache.device)
+        # Qwen4Exp: PLE stage buffer + per-slot conv state (graph-safe decode)
+        if self.is_q4e and hasattr(self.model, "allocate_ple"):
+            self.model.allocate_ple(
+                num_delta_slots,
+                max(config.max_num_batched_tokens, config.max_num_seqs),
+                self.kv_cache.device, state_dtype,
+            )
+            self.ple_needs_ids = True
+        else:
+            self.ple_needs_ids = False
         layer_id = 0
         import os as _os
         self.kv_shadow_enabled = bool(_os.environ.get("ADALLM_KV_SHADOW"))
@@ -301,6 +318,27 @@ class ModelRunner:
             if m.mamba_state is not None:
                 m.mamba_state[slot].zero_()
                 m.conv_state[slot].zero_()
+        if self.is_q4e:
+            self.model.ple_reset_slot(slot)
+
+    def _ple_prepare(self, seqs: list[Sequence], is_prefill: bool):
+        """Host-side PLE ngram prep. For prefill, hist = previous 2 tokens of
+        the sequence (eos-padded) + this chunk; decode: hist = last 2 tokens
+        before the new one. Both ranks must run this identically."""
+        ctx_len = 2
+        eos = 248044
+        segments = []
+        if is_prefill:
+            for seq in seqs:
+                start = seq.num_cached_tokens + seq.num_prefilled_tokens
+                chunk = seq.cur_chunk if seq.cur_chunk > 0 else len(seq) - start
+                hist = list(seq[start - ctx_len:start]) if start >= ctx_len else [eos] * (ctx_len - start) + list(seq[:start])
+                segments.append((hist, list(seq[start:start + chunk])))
+        else:
+            for seq in seqs:
+                hist = list(seq[-(ctx_len + 1):-1]) if len(seq) >= ctx_len + 1 else [eos] * (ctx_len + 1 - len(seq)) + list(seq[:-1])
+                segments.append((hist, [seq.last_token]))
+        self.model.ple_prepare(segments)
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -495,6 +533,8 @@ class ModelRunner:
     @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        if self.ple_needs_ids:
+            self._ple_prepare(seqs, is_prefill)
         if self.rank == 0:
             temperatures = self.prepare_sample(seqs)
             if GRAPH_SAMPLE_ENABLED and not is_prefill and not self.enforce_eager and len(seqs) <= 512:

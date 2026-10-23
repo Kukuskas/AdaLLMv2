@@ -120,6 +120,12 @@ def load_model(model: nn.Module, path: str):
             show_progress = False
     except Exception:
         pass
+
+    # ---- Qwen4Exp fast path ------------------------------------------------
+    q4e_map = getattr(model, "q4e_map", None)
+    if q4e_map is not None:
+        return _load_qwen4_exp(model, path, q4e_map, show_progress)
+
     total = _estimate_total_weights(path, keep_weight_scales) if show_progress else None
     pbar = tqdm(
         total=total,
@@ -406,6 +412,89 @@ def load_model(model: nn.Module, path: str):
         # the quantize+repack spike (transient fp32 chunks) poisons the CUDA
         # peak-memory high-water mark used for KV pool sizing → reset it
         torch.cuda.reset_peak_memory_stats()
+
+
+def _load_qwen4_exp(model: nn.Module, path: str, q4e_map, show_progress: bool):
+    """Dedicated loader for the Qwen4Exp checkpoint layout.
+
+    - 297,984 expert tensors (512 experts x 48 layers x 3 projs x 4 tensors):
+      routed by regex to the EP params; REMOTE experts are skipped without
+      materializing the tensor (checkpoint file shard is still read by
+      safetensors' lazy get_tensor, but only local rows are copied).
+    - 128 PLE shard tensors (~51GB): skipped entirely (mmap at runtime).
+    - everything else: dense BF16 / packed-NVFP4 copies by exact name.
+    """
+    index_path = os.path.join(path, "model.safetensors.index.json")
+    with open(index_path, "r", encoding="utf-8") as f:
+        weight_map = json.load(f)["weight_map"]
+    # group names by file for single-pass reads
+    by_file: dict[str, list[str]] = {}
+    for name, fname in weight_map.items():
+        by_file.setdefault(fname, []).append(name)
+
+    n_local = 0
+    n_skip = 0
+    pbar = tqdm(total=len(weight_map), desc="Loading qwen4_exp", disable=not show_progress, dynamic_ncols=True)
+    for fname in sorted(by_file.keys()):
+        fpath = os.path.join(path, fname)
+        with safe_open(fpath, framework="pt", device="cpu") as f:
+            for weight_name in sorted(by_file[fname]):
+                mapped = q4e_map(weight_name)
+                if mapped is not None:
+                    kind = mapped[0]
+                    if kind == "ple_skip":
+                        n_skip += 1
+                        pbar.update(1)
+                        continue
+                    if kind == "expert":
+                        _, layer_idx, gid, new_name = mapped
+                        if not model.expert_is_local(layer_idx, gid):
+                            n_skip += 1
+                            pbar.update(1)
+                            continue
+                        t = f.get_tensor(weight_name)
+                        if t.dtype == torch.uint8 or weight_name.endswith("weight_scale_2"):
+                            pass  # packed weight / fp32 scale_2: direct
+                        elif weight_name.endswith(".weight_scale"):
+                            t = t.view(torch.float8_e4m3fn).to(torch.float16)
+                        model.load_expert_tensor(new_name, gid, t)
+                        n_local += 1
+                        pbar.update(1)
+                        continue
+                    if kind == "ple_scale":
+                        model.load_ple_scale(mapped[1], f.get_tensor(weight_name))
+                        pbar.update(1)
+                        continue
+                # ---- dense path (everything else) ----
+                if _should_ignore_weight(weight_name):
+                    n_skip += 1
+                    pbar.update(1)
+                    continue
+                if weight_name.startswith("mtp."):
+                    n_skip += 1
+                    pbar.update(1)
+                    continue
+                loaded_weight = f.get_tensor(weight_name)
+                try:
+                    param = model.get_parameter(weight_name)
+                except (KeyError, AttributeError):
+                    param = model.get_buffer(weight_name)
+                if param is None:
+                    raise KeyError(f"q4e dense param not found: {weight_name}")
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                n_local += 1
+                pbar.update(1)
+    pbar.close()
+    if show_progress:
+        print(f"[q4e-load] loaded={n_local} skipped={n_skip}", flush=True)
+    # attach the mmap'd PLE table file
+    ple_path = os.path.join(path, "model-fp8-mtp-ple.safetensors")
+    if os.path.isfile(ple_path):
+        model.attach_ple_file(ple_path)
+    else:
+        print("[q4e-load] WARNING: model-fp8-mtp-ple.safetensors missing; PLE table unavailable", flush=True)
+    return None
 
 
 def _init_nvfp4_bcol_scales(model: nn.Module):

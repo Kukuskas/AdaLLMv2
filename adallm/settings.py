@@ -123,6 +123,23 @@ def _load_local_config(model_path: str):
         )
         return ns
 
+    # Qwen4Exp (Qwen3.8-Flash-Next): same multimodal-wrapper treatment.
+    if model_type == "qwen4_exp":
+        text = cfg.get("text_config", {})
+        skip = {"model_type", "dtype", "architectures", "torch_dtype",
+                "quantization_config", "max_position_embeddings", "mtp"}
+        eos = text.get("eos_token_id", 248044)
+        ns = SimpleNamespace(
+            model_type="qwen4_exp",
+            architectures=cfg.get("architectures"),
+            torch_dtype=_dtype_from_str(cfg.get("torch_dtype") or cfg.get("dtype")),
+            max_position_embeddings=text.get("max_position_embeddings", 262144),
+            quantization_config=cfg.get("quantization_config", None),
+            eos_token_id=eos,
+            **{k: v for k, v in text.items() if k not in skip and k != "eos_token_id"},
+        )
+        return ns
+
     return None
 
 
