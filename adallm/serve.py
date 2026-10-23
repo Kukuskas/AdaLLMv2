@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 import faulthandler
 import signal
@@ -29,7 +30,9 @@ class CompletionRequest(BaseModel):
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    name: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -42,19 +45,72 @@ class ChatCompletionRequest(BaseModel):
     n: int = 1
     stream: bool = False
     chat_template_kwargs: dict | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    parallel_tool_calls: bool | None = None  # accepted for OpenAI compat; not enforced
 
 
-def _build_chat_prompt(messages: list[ChatMessage], tokenizer=None, template_kwargs: dict | None = None) -> str:
+def _default_template_kwargs() -> dict | None:
+    """Server-level default thinking control: mm-go passes --reasoning on|off
+    via the driver env (ADALLM_REASONING). off -> Qwen enable_thinking=False."""
+    r = os.getenv("ADALLM_REASONING", "").strip().lower()
+    if r == "off":
+        return {"enable_thinking": False}
+    if r == "on":
+        return {"enable_thinking": True}
+    return None
+
+
+def _hf_message(m: ChatMessage) -> dict[str, Any]:
+    """Map an API ChatMessage to the HF template dict. The Qwen3.8 template
+    requires tool_calls[].function.arguments as a DICT (OpenAI clients send a
+    JSON string), and accepts role='tool' messages natively."""
+    d: dict[str, Any] = {"role": m.role}
+    if m.content is not None:
+        d["content"] = m.content
+    if m.name is not None:
+        d["name"] = m.name
+    if m.tool_calls:
+        tc_out = []
+        for tc in m.tool_calls:
+            fn = dict(tc.get("function") or {})
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                try:
+                    fn["arguments"] = json.loads(args)
+                except Exception:
+                    fn["arguments"] = {"raw": args}
+            tc2 = dict(tc)
+            tc2["function"] = fn
+            tc_out.append(tc2)
+        d["tool_calls"] = tc_out
+    return d
+
+
+def _build_chat_prompt(
+    messages: list[ChatMessage],
+    tokenizer=None,
+    template_kwargs: dict | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+) -> str:
     # Prefer the model's real chat template (correct <|im_start|> framing,
     # thinking control via chat_template_kwargs). Fallback: naive transcript.
     if tokenizer is not None and getattr(tokenizer, "chat_template", None):
-        hf_messages = [{"role": m.role, "content": m.content} for m in messages]
+        hf_messages = [_hf_message(m) for m in messages]
+        kwargs = dict(template_kwargs or {})
+        # tool_choice='none' suppresses tool rendering entirely; 'auto'/'required'
+        # are prompt-level concepts here — Qwen renders tools and the model decides.
+        if tool_choice == "none":
+            tools = None
+        if tools is not None:
+            kwargs["tools"] = tools
         try:
             return tokenizer.apply_chat_template(
                 hf_messages,
                 tokenize=False,
                 add_generation_prompt=True,
-                **(template_kwargs or {}),
+                **kwargs,
             )
         except Exception:
             pass
@@ -66,6 +122,105 @@ def _build_chat_prompt(messages: list[ChatMessage], tokenizer=None, template_kwa
         parts.append(f"{role}: {msg.content}")
     parts.append("assistant:")
     return "\n".join(parts)
+
+
+def _parse_xml_tool_call(body: str) -> dict[str, Any] | None:
+    """Parse Qwen3.8 XML-style tool call body:
+        <function=name>\n<parameter=k>\nv\n</parameter>\n</function>
+    (this is the format the Qwen3.8 chat template instructs the model to use)."""
+    m = re.search(r"<function=([^>]+)>", body)
+    if not m:
+        return None
+    name = m.group(1).strip()
+    args: dict[str, Any] = {}
+    for pm in re.finditer(r"<parameter=([^>]+)>(.*?)</parameter>", body, re.DOTALL):
+        args[pm.group(1).strip()] = pm.group(2).strip()
+    return {"name": name, "arguments": args}
+
+
+def _parse_tool_call_json(raw: str) -> dict[str, Any] | None:
+    """Parse the JSON body of a <tool_call> block. Qwen occasionally wraps
+    values in single quotes — retry with quote normalization + literal_eval."""
+    raw = raw.strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    try:
+        import ast
+        normalized = raw.replace("'", '"') if '"' not in raw else raw
+        obj = ast.literal_eval(normalized)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    return None
+
+
+def _parse_tool_call_body(body: str) -> dict[str, Any] | None:
+    """Parse a <tool_call> block body: Qwen3.8 XML style first
+    (<function=..><parameter=..>v</parameter></function>), legacy JSON style
+    ({"name":..., "arguments":{...}}) as fallback."""
+    parsed = _parse_xml_tool_call(body)
+    if parsed is not None:
+        return parsed
+    return _parse_tool_call_json(body)
+
+
+def _extract_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """Scan generated text for Qwen tool-call blocks:
+        <tool_call>\n{"name": ..., "arguments": {...}}\n</tool_call>
+    Returns (content_without_blocks, [openai tool_call dicts]).
+    Malformed JSON inside a block: log, keep the block in content."""
+    tool_calls: list[dict[str, Any]] = []
+    content_parts: list[str] = []
+    pos = 0
+    open_tag, close_tag = "<tool_call>", "</tool_call>"
+    while True:
+        start = text.find(open_tag, pos)
+        if start == -1:
+            content_parts.append(text[pos:])
+            break
+        content_parts.append(text[pos:start])
+        end = text.find(close_tag, start)
+        if end == -1:
+            # unterminated block (max_tokens cut): try to parse what's there
+            body = text[start + len(open_tag):]
+            parsed = _parse_tool_call_body(body)
+            if (
+                parsed is not None
+                and isinstance(parsed.get("name"), str)
+                and isinstance(parsed.get("arguments", {}), dict)
+            ):
+                args = parsed.get("arguments") or {}
+                tool_calls.append({
+                    "id": f"call_{len(tool_calls)}",
+                    "type": "function",
+                    "function": {"name": parsed["name"], "arguments": json.dumps(args)},
+                })
+            else:
+                print(f"[tools] unterminated/malformed tool_call block kept in content: {body[:200]!r}", file=sys.stderr, flush=True)
+                content_parts.append(text[start:])
+            break
+        body = text[start + len(open_tag):end]
+        parsed = _parse_tool_call_body(body)
+        if (
+            parsed is not None
+            and isinstance(parsed.get("name"), str)
+            and isinstance(parsed.get("arguments", {}), dict)
+        ):
+            args = parsed.get("arguments") or {}
+            tool_calls.append({
+                "id": f"call_{len(tool_calls)}",
+                "type": "function",
+                "function": {"name": parsed["name"], "arguments": json.dumps(args)},
+            })
+        else:
+            print(f"[tools] malformed tool_call block kept in content: {body[:200]!r}", file=sys.stderr, flush=True)
+            content_parts.append(text[start:end + len(close_tag)])
+        pos = end + len(close_tag)
+    content = "".join(content_parts).strip()
+    return content, tool_calls
 
 
 def _split_thinking(text: str) -> tuple[str, str]:
@@ -127,13 +282,22 @@ def _chat_completion_response(
     choices = []
     for idx, out in enumerate(outputs):
         content, reasoning = _split_thinking(out["text"])
-        msg: dict[str, Any] = {"role": "assistant", "content": content}
+        finish_reason = out.get("finish_reason") or "length"
+        # Qwen tool-call extraction: strip <tool_call> blocks from content and
+        # surface them as OpenAI message.tool_calls; finish_reason -> 'tool_calls'
+        # when at least one call parsed and the model wasn't cut by max_tokens.
+        content, tool_calls = _extract_tool_calls(content)
+        msg: dict[str, Any] = {"role": "assistant", "content": content if content else None}
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+            if finish_reason != "length":
+                finish_reason = "tool_calls"
         if reasoning:
             msg["reasoning_content"] = reasoning
         choices.append({
             "index": idx,
             "message": msg,
-            "finish_reason": out.get("finish_reason") or "length",
+            "finish_reason": finish_reason,
         })
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
@@ -331,7 +495,13 @@ def _build_app(llm: AdaLLM, model_name: str) -> FastAPI:
             print(f"[http] chat_completions ENTRY t={_th.get_ident()}", file=sys.stderr, flush=True)
         if req.n != 1:
             raise HTTPException(status_code=400, detail="Only n=1 is supported.")
-        prompt = _build_chat_prompt(req.messages, getattr(llm, "tokenizer", None), req.chat_template_kwargs)
+        prompt = _build_chat_prompt(
+            req.messages,
+            getattr(llm, "tokenizer", None),
+            req.chat_template_kwargs or _default_template_kwargs(),
+            tools=req.tools,
+            tool_choice=req.tool_choice,
+        )
         # max_tokens=None (client sent none) -> generate until EOS/model limit,
         # NOT the old silent default of 16 which truncated thinking models mid-thought.
         _mt = req.max_tokens if req.max_tokens is not None else min(8192, getattr(llm, "max_model_len", 8192))
