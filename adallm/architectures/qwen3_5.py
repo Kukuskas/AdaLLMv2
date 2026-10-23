@@ -76,11 +76,28 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.num_k_heads = config.linear_num_key_heads
         self.head_k_dim = config.linear_key_head_dim
         self.head_v_dim = config.linear_value_head_dim
+        self.layer_idx = layer_idx
+        self.layer_norm_epsilon = config.rms_norm_eps
+
+        # Round8-E (TP=2): head-shard the delta-net across TP ranks. Value and
+        # key heads divide evenly (48 v / 16 k -> 24 / 8 at tp=2), so every
+        # per-head quantity (in_proj_qkv/z/b/a outputs, dt_bias, A_log, conv
+        # channels, recurrent/conv state pools) shards by contiguous head
+        # ranges. The vLLM Triton kernels are shape-dynamic (HV/K/V inferred
+        # from the state-pool tensor), so no kernel changes are needed.
+        # At tp==1 every attribute and module below is EXACTLY as before —
+        # bitwise-identical to the tuned single-GPU stack.
+        import torch.distributed as _dist
+        _tp = _dist.get_world_size() if _dist.is_initialized() else 1
+        self.tp_size = _tp
+        self.tp_rank = _dist.get_rank() if _tp > 1 else 0
+        if _tp > 1:
+            assert self.num_v_heads % _tp == 0 and self.num_k_heads % _tp == 0
+            self.num_v_heads = self.num_v_heads // _tp
+            self.num_k_heads = self.num_k_heads // _tp
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.conv_kernel_size = config.linear_conv_kernel_dim
-        self.layer_idx = layer_idx
-        self.layer_norm_epsilon = config.rms_norm_eps
 
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.conv1d = nn.Conv1d(
@@ -91,25 +108,53 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             groups=self.conv_dim,
             padding=self.conv_kernel_size - 1,
         )
+        # conv1d channels follow the sharded head ranges. The checkpoint's
+        # [conv_dim, 1, k] dim 0 is the SAME [Q(Kf) | K(Kf) | V(Vf)] concat
+        # as in_proj_qkv, so it needs the SECTION-wise head slicer — a plain
+        # contiguous dim-0 narrow would grab all of Q, all of K and part of V.
+        self.conv1d.weight.weight_loader = self._qkv_head_shard_loader
 
         # Split projections matching checkpoint names exactly.
-        self.in_proj_qkv = ReplicatedLinear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
-        self.in_proj_z = ReplicatedLinear(self.hidden_size, self.value_dim, bias=False)
-        self.in_proj_b = ReplicatedLinear(self.hidden_size, self.num_v_heads, bias=False)
-        self.in_proj_a = ReplicatedLinear(self.hidden_size, self.num_v_heads, bias=False)
+        if _tp > 1:
+            # ColumnParallel shards the OUTPUT dim by contiguous head ranges —
+            # exactly the per-rank head slice (in_proj_qkv output is the
+            # contiguous concat [Q(key_dim) | K(key_dim) | V(value_dim)], whose
+            # head groups divide evenly, so dim-0 narrowing respects head
+            # head boundaries). out_proj becomes RowParallel again: pass the
+            # FULL value_dim (RowParallelLinear divides input by tp itself);
+            # each rank's K slice = its contiguous v-head range, matching the
+            # head-sharded activation; partials all-reduce to the full result.
+            _full_k = config.linear_num_key_heads * self.head_k_dim
+            _full_v = config.linear_num_value_heads * self.head_v_dim
+            self.in_proj_qkv = ColumnParallelLinear(self.hidden_size, _full_k * 2 + _full_v, bias=False)
+            # ColumnParallelLinear's default loader narrows dim 0
+            # CONTIGUOUSLY, but in_proj_qkv's full output is the concat
+            # [Q(Kf) | K(Kf) | V(Vf)] — the rank's head range lives in THREE
+            # separate row sections. Replace the loader with a section-wise
+            # head slicer (for both the packed weight and its per-group
+            # scales; both are dim-0 sectioned identically).
+            self.in_proj_qkv.weight_loader = self._qkv_head_shard_loader
+            self.in_proj_qkv.weight.weight_loader = self._qkv_head_shard_loader
+            if hasattr(self.in_proj_qkv, "weight_scale"):
+                self.in_proj_qkv.weight_scale.weight_loader = self._qkv_head_shard_loader
+            self.in_proj_z = ColumnParallelLinear(self.hidden_size, _full_v, bias=False)
+            self.in_proj_b = ColumnParallelLinear(self.hidden_size, config.linear_num_value_heads, bias=False)
+            self.in_proj_a = ColumnParallelLinear(self.hidden_size, config.linear_num_value_heads, bias=False)
+            self.out_proj = RowParallelLinear(_full_v, self.hidden_size, bias=False)
+        else:
+            self.in_proj_qkv = ReplicatedLinear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
+            self.in_proj_z = ReplicatedLinear(self.hidden_size, self.value_dim, bias=False)
+            self.in_proj_b = ReplicatedLinear(self.hidden_size, self.num_v_heads, bias=False)
+            self.in_proj_a = ReplicatedLinear(self.hidden_size, self.num_v_heads, bias=False)
+            self.out_proj = ReplicatedLinear(self.value_dim, self.hidden_size, bias=False)
 
+        # dt_bias/A_log are per-v-head [num_v_heads]: each rank keeps its own
+        # head chunk of the checkpoint tensor.
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
         self.A_log = nn.Parameter(torch.zeros(self.num_v_heads))
+        self.dt_bias.weight_loader = self._sharded_dim0_loader
+        self.A_log.weight_loader = self._sharded_dim0_loader
         self.norm = Qwen3NextRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
-        # Round8-D (TP=2): out_proj must be REPLICATED, not RowParallel. The
-        # value heads are NOT sharded across TP ranks (in_proj_qkv/z/b/a are
-        # replicated, delta state pool is per-rank full-copy), so the
-        # activation entering out_proj is full-size (value_dim). A RowParallel
-        # out_proj sharded its K to value_dim/world_size → marlin shape
-        # mismatch (a.size(1)=6144 vs size_k=3072) at TP=2. Keep the
-        # computation replicated; the all-reduce savings on this one layer
-        # per delta block are not worth the head-sharding surgery yet.
-        self.out_proj = ReplicatedLinear(self.value_dim, self.hidden_size, bias=False)
 
         # CUDA-graph-safe recurrent state pool (vLLM mamba-style):
         #   mamba_state: [num_slots, HV, V, K]; conv_state: [num_slots, conv_dim, kernel-1]
@@ -132,6 +177,37 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             num_slots, self.conv_dim, self.conv_kernel_size - 1,
             device=device, dtype=dtype,
         )
+
+    def _sharded_dim0_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, *_):
+        """Round8-E: load the rank's contiguous dim-0 head chunk at tp>1;
+        identity copy at tp==1 (bitwise-identical single-GPU behavior)."""
+        if self.tp_size > 1:
+            shard = param.data.size(0)
+            loaded_weight = loaded_weight.narrow(0, self.tp_rank * shard, shard)
+        param.data.copy_(loaded_weight)
+
+    def _qkv_head_shard_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, *_):
+        """Round8-E: section-wise head shard for in_proj_qkv. The checkpoint
+        tensor's dim 0 is [Q(Kf) | K(Kf) | V(Vf)]; each rank takes its head
+        range WITHIN EACH SECTION and re-concats, yielding the local
+        [Q(Kf/tp) | K(Kf/tp) | V(Vf/tp)] rows. Works identically for the
+        packed weight [N, H/2] and per-group scales [N, H/gs]."""
+        if self.tp_size == 1:
+            param.data.copy_(loaded_weight)
+            return
+        full_k = self.num_k_heads * self.tp_size * self.head_k_dim
+        full_v = self.num_v_heads * self.tp_size * self.head_v_dim
+        r, tp = self.tp_rank, self.tp_size
+        sections = [
+            loaded_weight.narrow(0, 0, full_k),                      # Q
+            loaded_weight.narrow(0, full_k, full_k),                 # K
+            loaded_weight.narrow(0, 2 * full_k, full_v),             # V
+        ]
+        sharded = torch.cat(
+            [s.narrow(0, r * (s.size(0) // tp), s.size(0) // tp) for s in sections],
+            dim=0,
+        )
+        param.data.copy_(sharded)
 
     def _split_qkv(self, mixed_qkv: torch.Tensor):
         # HF qwen3_5 layout is contiguous: [Q(key_dim) | K(key_dim) | V(value_dim)]
